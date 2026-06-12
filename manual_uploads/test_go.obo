@@ -1,0 +1,18 @@
+format-version: 1.2
+
+[Term]
+id: GO:9000001
+name: ANDES manual upload root
+namespace: biological_process
+
+[Term]
+id: GO:9000002
+name: ANDES manual query genes
+namespace: biological_process
+is_a: GO:9000001 ! ANDES manual upload root
+
+[Term]
+id: GO:9000003
+name: ANDES manual ranked genes
+namespace: biological_process
+is_a: GO:9000001 ! ANDES manual upload root

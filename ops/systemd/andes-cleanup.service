@@ -1,0 +1,8 @@
+[Unit]
+Description=ANDES v2 weekly cache and job cleanup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/andes-app/v2/backend
+EnvironmentFile=/opt/andes-app/v2/.env
+ExecStart=/usr/bin/env uv run andes cleanup

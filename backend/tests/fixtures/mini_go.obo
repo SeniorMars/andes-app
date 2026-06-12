@@ -1,0 +1,17 @@
+format-version: 1.2
+
+[Term]
+id: GO:0000001
+name: root biological process
+namespace: biological_process
+
+[Term]
+id: GO:0000002
+name: child biological process
+namespace: biological_process
+is_a: GO:0000001 ! root biological process
+
+[Term]
+id: GO:0000003
+name: molecular function term
+namespace: molecular_function

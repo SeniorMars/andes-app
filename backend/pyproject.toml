@@ -1,0 +1,61 @@
+[project]
+name = "andes-appv2-backend"
+version = "0.1.0"
+description = "FastAPI and worker backend for ANDES app v2"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "numba==0.59.1",
+    "numpy==1.26.4",
+    "pandas==2.2.2",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-multipart>=0.0.20",
+    "scipy==1.12.0",
+    "statsmodels==0.14.2",
+    "threadpoolctl==3.5.0",
+    "tqdm==4.66.4",
+    "typer>=0.15.0",
+    "uvicorn[standard]>=0.34.0",
+]
+
+[project.scripts]
+andes-api = "andes_api.main:main"
+andes-worker = "andes_worker.main:main"
+andes = "andes_core.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/andes_core",
+    "src/andes_api",
+    "src/andes_worker",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.14.0",
+    "pytest>=8.3.0",
+    "ruff>=0.9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true

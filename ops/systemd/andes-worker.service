@@ -1,0 +1,14 @@
+[Unit]
+Description=ANDES v2 Worker
+After=network.target andes-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/andes-app/v2/backend
+EnvironmentFile=/opt/andes-app/v2/.env
+ExecStart=/usr/bin/env uv run andes-worker
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

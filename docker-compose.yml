@@ -1,0 +1,64 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["uv", "run", "andes-api"]
+    environment: &andes_env
+      ANDES_ORIGINAL_SRC: /andes-original/src
+      ANDES_EMBEDDING_PATH: /andes-original/data/embedding/node2vec_consensus.csv
+      ANDES_GENE_LIST_PATH: /andes-original/data/embedding/consensus_node.txt
+      ANDES_DEFAULT_GENE_SET_PATH: /andes-original/data/gene_sets/hsa_experimental_eval_BP_propagated.gmt
+      ANDES_CACHE_DIR: /app/cache
+      ANDES_RUNS_DIR: /app/runs
+      ANDES_SQLITE_PATH: /app/runs/jobs.sqlite3
+      ANDES_WORKERS: "${ANDES_WORKERS:-8}"
+      ANDES_NULL_ITERATIONS: "${ANDES_NULL_ITERATIONS:-1000}"
+      ANDES_MAX_TERM_PAIRS: "${ANDES_MAX_TERM_PAIRS:-500000}"
+      ANDES_MAX_UPLOAD_BYTES: "${ANDES_MAX_UPLOAD_BYTES:-10000000}"
+      ANDES_MAX_TERMS_PER_COLLECTION: "${ANDES_MAX_TERMS_PER_COLLECTION:-20000}"
+      ANDES_MAX_QUEUED_JOBS: "${ANDES_MAX_QUEUED_JOBS:-100}"
+      ANDES_MAX_JOBS_PER_OWNER: "${ANDES_MAX_JOBS_PER_OWNER:-10}"
+      ANDES_RUNNING_JOB_TIMEOUT_SECONDS: "${ANDES_RUNNING_JOB_TIMEOUT_SECONDS:-21600}"
+    ports:
+      - "8000:8000"
+    volumes:
+      - "${ANDES_ORIGINAL_ROOT:-/Users/charlie/Acdemica/ylab/ANDES}:/andes-original:ro"
+      - ./cache:/app/cache
+      - ./runs:/app/runs
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["uv", "run", "andes-worker"]
+    environment: *andes_env
+    volumes:
+      - "${ANDES_ORIGINAL_ROOT:-/Users/charlie/Acdemica/ylab/ANDES}:/andes-original:ro"
+      - ./cache:/app/cache
+      - ./runs:/app/runs
+    depends_on:
+      - api
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      NEXT_PUBLIC_API_URL: "${NEXT_PUBLIC_API_URL:-http://localhost:8000}"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  cleanup:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["uv", "run", "andes", "cleanup"]
+    profiles: ["ops"]
+    environment: *andes_env
+    volumes:
+      - "${ANDES_ORIGINAL_ROOT:-/Users/charlie/Acdemica/ylab/ANDES}:/andes-original:ro"
+      - ./cache:/app/cache
+      - ./runs:/app/runs
