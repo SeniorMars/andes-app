@@ -9,11 +9,12 @@ from andes_core.config import AndesSettings
 from andes_core.schemas import AnalysisKind, JobState
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+ORIGINAL_SRC = Path("/Users/charlie/Acdemica/ylab/ANDES/src")
 
 
 def _settings(tmp_path: Path) -> AndesSettings:
     return AndesSettings(
-        original_src=Path(__file__).resolve().parents[1],
+        original_src=ORIGINAL_SRC,
         embedding_path=FIXTURES / "mini_embedding.csv",
         gene_list_path=FIXTURES / "mini_genes.txt",
         default_gene_set_path=FIXTURES / "mini_gene_sets.gmt",
@@ -47,6 +48,12 @@ def test_data_status_reports_cache_without_requiring_it_for_readiness():
     assert "config" in payload
     assert payload["config"]["workers"] >= 1
     assert "cache_dir" not in payload["checks"]
+    assert "root" not in payload["cache"]
+    assert "path" not in payload["cache"]["bma"]
+    assert "path" not in payload["cache"]["es"]
+    assert "sqlite_path" not in payload["jobs"]
+    assert "runs_dir" not in payload["jobs"]
+    assert "alias_path" not in payload["config"]
 
 
 def test_local_loopback_dev_origin_is_allowed():
@@ -183,7 +190,9 @@ def test_queue_position_and_cancel_endpoint(tmp_path):
 
 
 def test_queue_owner_limit_rejects_too_many_active_jobs(tmp_path):
-    settings = _settings(tmp_path).model_copy(update={"max_jobs_per_owner": 1})
+    settings = _settings(tmp_path).model_copy(
+        update={"max_jobs_per_owner": 1, "trusted_user_header": "x-andes-user"}
+    )
     app = create_app(settings)
     client = TestClient(app)
     headers = {"x-andes-user": "charlie"}
@@ -197,6 +206,27 @@ def test_queue_owner_limit_rejects_too_many_active_jobs(tmp_path):
         "/jobs/gsea",
         data={"ranked_text": "A\t1\nB\t0", "min_gene_set_size": "1", "max_gene_set_size": "3"},
         headers=headers,
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 429
+    assert "too many queued/running jobs" in second.json()["detail"]
+
+
+def test_queue_owner_limit_ignores_untrusted_user_header(tmp_path):
+    settings = _settings(tmp_path).model_copy(update={"max_jobs_per_owner": 1})
+    app = create_app(settings)
+    client = TestClient(app)
+
+    first = client.post(
+        "/jobs/set-similarity",
+        data={"genes_text": "A\nB", "min_gene_set_size": "1", "max_gene_set_size": "3"},
+        headers={"x-andes-user": "one"},
+    )
+    second = client.post(
+        "/jobs/gsea",
+        data={"ranked_text": "A\t1\nB\t0", "min_gene_set_size": "1", "max_gene_set_size": "3"},
+        headers={"x-andes-user": "two"},
     )
 
     assert first.status_code == 202
@@ -223,6 +253,40 @@ def test_global_queue_limit_rejects_when_queue_is_full(tmp_path):
     assert first.status_code == 202
     assert second.status_code == 429
     assert "server queue is full" in second.json()["detail"]
+
+
+def test_admin_token_protects_admin_endpoints(tmp_path):
+    app = create_app(_settings(tmp_path).model_copy(update={"admin_token": "secret"}))
+    client = TestClient(app)
+
+    blocked = client.get("/admin/queue")
+    allowed = client.get("/admin/queue", headers={"x-andes-admin-token": "secret"})
+    status_allowed = client.get("/data/status", headers={"authorization": "Bearer secret"})
+
+    assert blocked.status_code == 403
+    assert allowed.status_code == 200
+    assert status_allowed.status_code == 200
+
+
+def test_cross_owner_cancel_requires_admin_token(tmp_path):
+    settings = _settings(tmp_path).model_copy(update={"admin_token": "secret"})
+    app = create_app(settings)
+    client = TestClient(app)
+    job = app.state.store.create_job(
+        AnalysisKind.SET_SIMILARITY,
+        {"genes": ["A"]},
+        owner_key="ip:other-client",
+    )
+
+    blocked = client.post(f"/jobs/{job.id}/cancel")
+    allowed = client.post(
+        f"/jobs/{job.id}/cancel",
+        headers={"x-andes-admin-token": "secret"},
+    )
+
+    assert blocked.status_code == 403
+    assert allowed.status_code == 200
+    assert allowed.json()["job"]["state"] == JobState.CANCELLED.value
 
 
 def test_admin_queue_and_recover_stale_endpoint(tmp_path):

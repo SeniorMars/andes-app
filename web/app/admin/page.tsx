@@ -1,9 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { AdminPasswordPanel } from "@/components/admin-password-panel";
 import type { DataStatus } from "@/lib/api";
-import { getDataStatus } from "@/lib/api";
+import {
+  clearStoredAdminToken,
+  getDataStatus,
+  isAdminAuthError,
+  setStoredAdminToken
+} from "@/lib/api";
 
 function formatBytes(value: number): string {
   if (!Number.isFinite(value)) return "NA";
@@ -29,18 +35,39 @@ function formatTime(timestamp?: number | null): string {
 export default function AdminPage() {
   const [status, setStatus] = useState<DataStatus | null>(null);
   const [error, setError] = useState("");
+  const [needsPassword, setNeedsPassword] = useState(false);
 
-  useEffect(() => {
-    async function load() {
-      try {
-        setStatus(await getDataStatus());
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load status");
+  const load = useCallback(async () => {
+    try {
+      setStatus(await getDataStatus());
+      setNeedsPassword(false);
+      setError("");
+    } catch (err) {
+      if (isAdminAuthError(err)) {
+        clearStoredAdminToken();
+        setStatus(null);
+        setNeedsPassword(true);
+        setError("Enter the admin password to continue.");
+        return;
       }
+      setError(err instanceof Error ? err.message : "Failed to load status");
     }
-    load();
   }, []);
 
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  function onUnlock(password: string) {
+    setStoredAdminToken(password);
+    setNeedsPassword(false);
+    setError("");
+    void load();
+  }
+
+  if (needsPassword) {
+    return <AdminPasswordPanel error={error} onSubmit={onUnlock} />;
+  }
   if (error) {
     return <section className="panel pad error">{error}</section>;
   }
@@ -114,7 +141,9 @@ export default function AdminPage() {
             <p className="eyebrow">Cache</p>
             <h2>Null-cache storage</h2>
           </div>
-          <span className="subtle">{status.cache.root}</span>
+          <span className={`status ${status.cache.exists ? "succeeded" : "failed"}`}>
+            {status.cache.exists ? "configured" : "missing"}
+          </span>
         </div>
         <div className="table-wrap">
           <table>
@@ -124,7 +153,6 @@ export default function AdminPage() {
                 <th>Files</th>
                 <th>Bytes</th>
                 <th>Newest use</th>
-                <th>Path</th>
               </tr>
             </thead>
             <tbody>
@@ -134,7 +162,6 @@ export default function AdminPage() {
                   <td>{cache.files}</td>
                   <td>{formatBytes(cache.bytes)}</td>
                   <td>{formatTime(cache.newest_mtime)}</td>
-                  <td className="mono">{cache.path}</td>
                 </tr>
               ))}
             </tbody>

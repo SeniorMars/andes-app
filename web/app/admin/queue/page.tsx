@@ -2,8 +2,16 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { AdminPasswordPanel } from "@/components/admin-password-panel";
 import type { AdminQueue, AdminQueueJob } from "@/lib/api";
-import { cancelJob, getAdminQueue, recoverStaleJobs } from "@/lib/api";
+import {
+  cancelJob,
+  clearStoredAdminToken,
+  getAdminQueue,
+  isAdminAuthError,
+  recoverStaleJobs,
+  setStoredAdminToken
+} from "@/lib/api";
 
 function formatDate(value?: string | null): string {
   if (!value) return "NA";
@@ -24,18 +32,34 @@ export default function AdminQueuePage() {
   const [error, setError] = useState("");
   const [busyJob, setBusyJob] = useState<string | null>(null);
   const [recovering, setRecovering] = useState(false);
+  const [needsPassword, setNeedsPassword] = useState(false);
+
+  const handleError = useCallback((err: unknown, fallback: string): boolean => {
+    if (isAdminAuthError(err)) {
+      clearStoredAdminToken();
+      setQueue(null);
+      setNeedsPassword(true);
+      setError("Enter the admin password to continue.");
+      return true;
+    }
+    setError(err instanceof Error ? err.message : fallback);
+    return false;
+  }, []);
 
   const load = useCallback(async () => {
     try {
       setQueue(await getAdminQueue());
+      setNeedsPassword(false);
       setError("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load queue");
+      handleError(err, "Failed to load queue");
     }
-  }, []);
+  }, [handleError]);
 
   useEffect(() => {
+    if (needsPassword) return;
     let active = true;
+    let timer: number | undefined;
     async function poll() {
       try {
         const data = await getAdminQueue();
@@ -43,15 +67,16 @@ export default function AdminQueuePage() {
         setQueue(data);
         setError("");
       } catch (err) {
-        if (active) setError(err instanceof Error ? err.message : "Failed to load queue");
+        if (active && handleError(err, "Failed to load queue")) return;
       }
-      if (active) window.setTimeout(poll, 3000);
+      if (active) timer = window.setTimeout(poll, 3000);
     }
     poll();
     return () => {
       active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, []);
+  }, [handleError, needsPassword]);
 
   async function onCancel(jobId: string) {
     setBusyJob(jobId);
@@ -59,7 +84,7 @@ export default function AdminQueuePage() {
       await cancelJob(jobId);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to cancel job");
+      handleError(err, "Failed to cancel job");
     } finally {
       setBusyJob(null);
     }
@@ -71,12 +96,22 @@ export default function AdminQueuePage() {
       await recoverStaleJobs();
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to recover stale jobs");
+      handleError(err, "Failed to recover stale jobs");
     } finally {
       setRecovering(false);
     }
   }
 
+  function onUnlock(password: string) {
+    setStoredAdminToken(password);
+    setNeedsPassword(false);
+    setError("");
+    void load();
+  }
+
+  if (needsPassword) {
+    return <AdminPasswordPanel error={error} onSubmit={onUnlock} />;
+  }
   if (error && !queue) {
     return <section className="panel pad error">{error}</section>;
   }

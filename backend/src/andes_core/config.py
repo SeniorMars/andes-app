@@ -34,6 +34,9 @@ class AndesSettings(BaseSettings):
 
     workers: int = 8
     job_concurrency: int = 1
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
+    api_reload: bool = False
     null_iterations: int = 1000
     seed: int | None = None
     query_memory_mb: float = 1024.0
@@ -51,6 +54,8 @@ class AndesSettings(BaseSettings):
     cache_max_bytes: int = 0
     job_max_age_days: int = 30
     job_min_keep: int = 20
+    admin_token: str | None = None
+    trusted_user_header: str | None = None
     cors_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:3000",

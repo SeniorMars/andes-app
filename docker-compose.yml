@@ -6,6 +6,7 @@ services:
     command: ["uv", "run", "andes-api"]
     environment: &andes_env
       ANDES_ORIGINAL_SRC: /andes-original/src
+      ANDES_API_HOST: 0.0.0.0
       ANDES_EMBEDDING_PATH: /andes-original/data/embedding/node2vec_consensus.csv
       ANDES_GENE_LIST_PATH: /andes-original/data/embedding/consensus_node.txt
       ANDES_DEFAULT_GENE_SET_PATH: /andes-original/data/gene_sets/hsa_experimental_eval_BP_propagated.gmt
@@ -20,8 +21,10 @@ services:
       ANDES_MAX_QUEUED_JOBS: "${ANDES_MAX_QUEUED_JOBS:-100}"
       ANDES_MAX_JOBS_PER_OWNER: "${ANDES_MAX_JOBS_PER_OWNER:-10}"
       ANDES_RUNNING_JOB_TIMEOUT_SECONDS: "${ANDES_RUNNING_JOB_TIMEOUT_SECONDS:-21600}"
+      ANDES_ADMIN_TOKEN: "${ANDES_ADMIN_TOKEN:-}"
+      ANDES_TRUSTED_USER_HEADER: "${ANDES_TRUSTED_USER_HEADER:-}"
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - "${ANDES_ORIGINAL_ROOT:-/Users/charlie/Acdemica/ylab/ANDES}:/andes-original:ro"
       - ./cache:/app/cache
@@ -47,7 +50,7 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: "${NEXT_PUBLIC_API_URL:-http://localhost:8000}"
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - api
 

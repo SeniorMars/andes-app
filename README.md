@@ -48,6 +48,9 @@ Useful environment variables:
 
 ```bash
 ANDES_ORIGINAL_SRC=/Users/charlie/Acdemica/ylab/ANDES/src
+ANDES_API_HOST=127.0.0.1
+ANDES_API_PORT=8000
+ANDES_API_RELOAD=false
 ANDES_EMBEDDING_PATH=/Users/charlie/Acdemica/ylab/ANDES/data/embedding/node2vec_consensus.csv
 ANDES_GENE_LIST_PATH=/Users/charlie/Acdemica/ylab/ANDES/data/embedding/consensus_node.txt
 ANDES_DEFAULT_GENE_SET_PATH=/Users/charlie/Acdemica/ylab/ANDES/data/gene_sets/hsa_experimental_eval_BP_propagated.gmt
@@ -70,6 +73,10 @@ ANDES_CACHE_MIN_KEEP_FILES=8
 ANDES_CACHE_MAX_BYTES=0
 ANDES_JOB_MAX_AGE_DAYS=30
 ANDES_JOB_MIN_KEEP=20
+# Optional admin protection for shared or proxied deployments.
+# ANDES_ADMIN_TOKEN=change-me
+# Optional. Only trust identity headers injected by your reverse proxy.
+# ANDES_TRUSTED_USER_HEADER=X-Authenticated-User
 ANDES_ALIAS_PATH=/path/to/gene_aliases.tsv
 ```
 
@@ -180,9 +187,11 @@ identity, so matching jobs are reproducible and cacheable without sharing one
 global Monte Carlo seed. Set `ANDES_SEED` only when an admin intentionally wants
 one fixed server seed for every cache.
 
-The API stores a simple owner key for queue limiting. If callers provide
-`X-ANDES-USER`, that value is used; otherwise the client IP is used. New jobs are
-rejected with HTTP 429 when `ANDES_MAX_QUEUED_JOBS` or
+The API stores a simple owner key for queue limiting. By default the client IP is
+used. If `ANDES_TRUSTED_USER_HEADER` is set, only that configured header is
+trusted as a user identity; do not point it at a caller-controlled header unless a
+reverse proxy authenticates and overwrites it. New jobs are rejected with HTTP 429 when
+`ANDES_MAX_QUEUED_JOBS` or
 `ANDES_MAX_JOBS_PER_OWNER` is exceeded. Job pages show queue position for queued
 jobs and expose a cancel button. Cancelling a queued job is immediate; cancelling
 a running job is best-effort and prevents the worker from writing success after
@@ -254,6 +263,15 @@ running, and recent jobs, queue positions, owner keys, cancellation controls, an
 a stale-job recovery action. Workers also recover running jobs older than
 `ANDES_RUNNING_JOB_TIMEOUT_SECONDS` before claiming new work.
 
+Admin/status endpoints are available without a token only from loopback clients.
+Set `ANDES_ADMIN_TOKEN` before exposing the API through a proxy or non-loopback
+bind. The browser admin UI prompts for this value, stores it in session storage,
+and sends it as `X-Andes-Admin-Token`. API clients can also send
+`Authorization: Bearer <token>`. For a shared web deployment, prefer a
+server-side proxy that authenticates the user and injects the admin token. Do
+not send the admin token over plain HTTP except on localhost; terminate HTTPS at
+the proxy before making the admin UI reachable off-machine.
+
 Per-job cache status is also shown in preflight. A `reuse` result means the
 needed null buckets already exist; `build` means no matching cache file exists;
 `extend_or_rebuild` means the file exists but some requested size buckets or
@@ -302,7 +320,8 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The compose stack runs four services:
+The compose stack runs four services and publishes web/API ports on host loopback
+only by default:
 
 - `api`: FastAPI on port 8000.
 - `worker`: queued job processor using the shared SQLite/runs directory.

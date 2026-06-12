@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import uvicorn
 
+from andes_core.config import get_settings
+
 
 def main() -> None:
-    uvicorn.run("andes_api.app:app", host="0.0.0.0", port=8000, reload=True)
+    settings = get_settings()
+    uvicorn.run(
+        "andes_api.app:app",
+        host=settings.api_host,
+        port=settings.api_port,
+        reload=settings.api_reload,
+    )

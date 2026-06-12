@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hmac
+import ipaddress
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -34,7 +36,6 @@ def _cache_status(cache_dir):
         total_bytes = sum(path.stat().st_size for path in files)
         newest = max((path.stat().st_mtime for path in files), default=None)
         return {
-            "path": str(directory),
             "exists": directory.exists(),
             "files": len(files),
             "bytes": total_bytes,
@@ -42,7 +43,6 @@ def _cache_status(cache_dir):
         }
 
     return {
-        "root": str(root),
         "exists": root.exists(),
         "bma": summarize("bma"),
         "es": summarize("es"),
@@ -53,6 +53,9 @@ def _config_status(settings: AndesSettings) -> dict[str, object]:
     return {
         "workers": settings.workers,
         "job_concurrency": settings.job_concurrency,
+        "api_host": settings.api_host,
+        "api_port": settings.api_port,
+        "api_reload": settings.api_reload,
         "null_iterations": settings.null_iterations,
         "seed": settings.seed,
         "query_memory_mb": settings.query_memory_mb,
@@ -68,7 +71,9 @@ def _config_status(settings: AndesSettings) -> dict[str, object]:
         "cache_max_bytes": settings.cache_max_bytes,
         "job_max_age_days": settings.job_max_age_days,
         "job_min_keep": settings.job_min_keep,
-        "alias_path": str(settings.alias_path) if settings.alias_path else None,
+        "admin_token_configured": bool(settings.admin_token),
+        "trusted_user_header": settings.trusted_user_header,
+        "alias_file_configured": bool(settings.alias_path),
     }
 
 
@@ -207,11 +212,16 @@ def _materialize_download_from_result(
 
 
 async def _read_upload_text(upload: UploadFile, *, label: str, max_bytes: int) -> str:
-    contents = await upload.read()
-    if len(contents) > max_bytes:
-        raise HTTPException(status_code=400, detail=f"{label} is larger than {max_bytes} bytes")
+    contents = bytearray()
+    while chunk := await upload.read(1024 * 1024):
+        contents.extend(chunk)
+        if len(contents) > max_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label} is larger than {max_bytes} bytes",
+            )
     try:
-        return contents.decode("utf-8")
+        return bytes(contents).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"{label} must be UTF-8 text") from exc
 
@@ -523,12 +533,48 @@ def _raise_if_preview_blocked(preview: dict[str, object]) -> None:
         )
 
 
-def _owner_key(request: Request) -> str:
-    user = request.headers.get("x-andes-user")
+def _owner_key(request: Request, settings: AndesSettings) -> str:
+    user = (
+        request.headers.get(settings.trusted_user_header)
+        if settings.trusted_user_header
+        else None
+    )
     if user and user.strip():
         return f"user:{user.strip()[:120]}"
     host = request.client.host if request.client else "unknown"
     return f"ip:{host}"
+
+
+def _admin_token_from_request(request: Request) -> str | None:
+    token = request.headers.get("x-andes-admin-token")
+    if token:
+        return token
+    authorization = request.headers.get("authorization", "")
+    prefix = "bearer "
+    if authorization.lower().startswith(prefix):
+        return authorization[len(prefix) :]
+    return None
+
+
+def _is_loopback_client(request: Request) -> bool:
+    host = request.client.host if request.client else ""
+    if host == "testclient":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _require_admin(request: Request, settings: AndesSettings) -> None:
+    if settings.admin_token:
+        token = _admin_token_from_request(request)
+        if token and hmac.compare_digest(token, settings.admin_token):
+            return
+        raise HTTPException(status_code=403, detail="admin token required")
+    if _is_loopback_client(request):
+        return
+    raise HTTPException(status_code=403, detail="admin token required for remote admin access")
 
 
 def _enforce_queue_limits(
@@ -561,7 +607,7 @@ def _enforce_queue_limits(
 def create_app(settings: AndesSettings | None = None) -> FastAPI:
     settings = settings or get_settings()
     store = JobStore(settings.sqlite_path, settings.runs_dir)
-    engine = AndesEngine(settings)
+    engine: AndesEngine | None = None
     app = FastAPI(title="ANDES App v2 API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -572,14 +618,22 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
     app.state.store = store
-    app.state.engine = engine
+    app.state.engine = None
+
+    def get_engine() -> AndesEngine:
+        nonlocal engine
+        if engine is None:
+            engine = AndesEngine(settings)
+            app.state.engine = engine
+        return engine
 
     @app.get("/health")
     def health():
         return {"ok": True}
 
     @app.get("/data/status")
-    def data_status():
+    def data_status(http_request: Request):
+        _require_admin(http_request, settings)
         checks = {
             "original_src": settings.original_src.exists(),
             "embedding_path": settings.embedding_path.exists(),
@@ -595,7 +649,8 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         }
 
     @app.get("/admin/queue")
-    def admin_queue(limit: int = 100):
+    def admin_queue(http_request: Request, limit: int = 100):
+        _require_admin(http_request, settings)
         return {
             "stats": store.job_counts(),
             "limits": {
@@ -607,7 +662,8 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         }
 
     @app.post("/admin/queue/recover-stale")
-    def recover_stale_jobs():
+    def recover_stale_jobs(http_request: Request):
+        _require_admin(http_request, settings)
         result = store.recover_stale_running(
             timeout_seconds=settings.running_job_timeout_seconds
         )
@@ -645,7 +701,7 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
-                return engine.preview_set_similarity(preview_request)
+                return get_engine().preview_set_similarity(preview_request)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -682,11 +738,11 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
-                preview = engine.preview_set_similarity(preview_request)
+                preview = get_engine().preview_set_similarity(preview_request)
                 _raise_if_preview_blocked(preview)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        owner_key = _owner_key(http_request)
+        owner_key = _owner_key(http_request, settings)
         _enforce_queue_limits(store, settings, owner_key=owner_key)
         job = store.create_job(
             AnalysisKind.SET_SIMILARITY,
@@ -723,7 +779,7 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
-                return engine.preview_gsea(preview_request)
+                return get_engine().preview_gsea(preview_request)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -754,11 +810,11 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
-                preview = engine.preview_gsea(preview_request)
+                preview = get_engine().preview_gsea(preview_request)
                 _raise_if_preview_blocked(preview)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        owner_key = _owner_key(http_request)
+        owner_key = _owner_key(http_request, settings)
         _enforce_queue_limits(store, settings, owner_key=owner_key)
         job = store.create_job(
             AnalysisKind.GSEA,
@@ -778,7 +834,12 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         return {"job": job, "result": result, "queue": store.queue_status(job_id)}
 
     @app.post("/jobs/{job_id}/cancel")
-    def cancel_job(job_id: str):
+    def cancel_job(http_request: Request, job_id: str):
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.owner_key != _owner_key(http_request, settings):
+            _require_admin(http_request, settings)
         result = store.cancel_job(job_id)
         if result is None:
             raise HTTPException(status_code=404, detail="job not found")

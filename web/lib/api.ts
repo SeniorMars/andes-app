@@ -107,14 +107,11 @@ export interface DataStatus {
   ready: boolean;
   checks: Record<string, boolean>;
   cache: {
-    root: string;
     exists: boolean;
     bma: CacheDirectoryStatus;
     es: CacheDirectoryStatus;
   };
   jobs: {
-    sqlite_path: string;
-    runs_dir: string;
     job_counts: Record<JobState, number>;
     run_directories: number;
     run_bytes: number;
@@ -142,7 +139,6 @@ export interface StaleRecoveryResult {
 }
 
 export interface CacheDirectoryStatus {
-  path: string;
   exists: boolean;
   files: number;
   bytes: number;
@@ -150,6 +146,17 @@ export interface CacheDirectoryStatus {
 }
 
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_URL;
+const ADMIN_TOKEN_STORAGE_KEY = "andes.adminToken";
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
 
 function getApiBase(): string {
   if (CONFIGURED_API_BASE) {
@@ -193,6 +200,43 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   );
 }
 
+function getSessionAdminToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY);
+}
+
+function getAdminToken(): string | null {
+  return getSessionAdminToken();
+}
+
+export function setStoredAdminToken(token: string): void {
+  if (typeof window === "undefined") return;
+  const trimmed = token.trim();
+  if (trimmed) {
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, trimmed);
+  }
+}
+
+export function clearStoredAdminToken(): void {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+}
+
+export function isAdminAuthError(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403;
+}
+
+function withAdminToken(init: RequestInit = {}): RequestInit {
+  const token = getAdminToken();
+  if (!token) return init;
+  const headers = new Headers(init.headers);
+  headers.set("x-andes-admin-token", token);
+  return {
+    ...init,
+    headers
+  };
+}
+
 function buildFormData(
   fieldName: string,
   text: string,
@@ -230,6 +274,10 @@ async function readApiError(response: Response): Promise<string> {
   return text || `${response.status} ${response.statusText}`;
 }
 
+async function throwApiError(response: Response): Promise<never> {
+  throw new ApiError(response.status, await readApiError(response));
+}
+
 export async function submitTextJob(
   path: string,
   fieldName: string,
@@ -243,7 +291,7 @@ export async function submitTextJob(
     body
   });
   if (!response.ok) {
-    throw new Error(await readApiError(response));
+    await throwApiError(response);
   }
   return response.json();
 }
@@ -261,7 +309,7 @@ export async function previewTextJob(
     body
   });
   if (!response.ok) {
-    throw new Error(await readApiError(response));
+    await throwApiError(response);
   }
   return response.json();
 }
@@ -271,47 +319,59 @@ export async function getJob(jobId: string): Promise<JobResponse> {
     cache: "no-store"
   });
   if (!response.ok) {
-    throw new Error(await readApiError(response));
+    await throwApiError(response);
   }
   return response.json();
 }
 
 export async function cancelJob(jobId: string): Promise<JobResponse> {
-  const response = await apiFetch(`/jobs/${jobId}/cancel`, {
-    method: "POST"
-  });
+  const response = await apiFetch(
+    `/jobs/${jobId}/cancel`,
+    withAdminToken({
+      method: "POST"
+    })
+  );
   if (!response.ok) {
-    throw new Error(await readApiError(response));
+    await throwApiError(response);
   }
   return response.json();
 }
 
 export async function getDataStatus(): Promise<DataStatus> {
-  const response = await apiFetch("/data/status", {
-    cache: "no-store"
-  });
+  const response = await apiFetch(
+    "/data/status",
+    withAdminToken({
+      cache: "no-store"
+    })
+  );
   if (!response.ok) {
-    throw new Error(await readApiError(response));
+    await throwApiError(response);
   }
   return response.json();
 }
 
 export async function getAdminQueue(): Promise<AdminQueue> {
-  const response = await apiFetch("/admin/queue", {
-    cache: "no-store"
-  });
+  const response = await apiFetch(
+    "/admin/queue",
+    withAdminToken({
+      cache: "no-store"
+    })
+  );
   if (!response.ok) {
-    throw new Error(await readApiError(response));
+    await throwApiError(response);
   }
   return response.json();
 }
 
 export async function recoverStaleJobs(): Promise<StaleRecoveryResult> {
-  const response = await apiFetch("/admin/queue/recover-stale", {
-    method: "POST"
-  });
+  const response = await apiFetch(
+    "/admin/queue/recover-stale",
+    withAdminToken({
+      method: "POST"
+    })
+  );
   if (!response.ok) {
-    throw new Error(await readApiError(response));
+    await throwApiError(response);
   }
   return response.json();
 }

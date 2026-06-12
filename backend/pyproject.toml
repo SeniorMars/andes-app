@@ -5,7 +5,7 @@ description = "FastAPI and worker backend for ANDES app v2"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "fastapi>=0.115.0",
-    "httpx>=0.28.0",
+    "httpx2>=2.4.0",
     "numba==0.59.1",
     "numpy==1.26.4",
     "pandas==2.2.2",

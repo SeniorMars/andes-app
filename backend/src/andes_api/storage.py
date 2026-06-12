@@ -341,8 +341,6 @@ class JobStore:
             file.stat().st_size for path in run_dirs for file in path.rglob("*") if file.is_file()
         )
         return {
-            "sqlite_path": str(self.sqlite_path),
-            "runs_dir": str(self.runs_dir),
             "job_counts": self.job_counts(),
             "run_directories": len(run_dirs),
             "run_bytes": total_bytes,
