@@ -184,10 +184,16 @@ function getFallbackApiBases(primary: string): string[] {
   return [...new Set(candidates)];
 }
 
+function hasSensitiveHeaders(init?: RequestInit): boolean {
+  const headers = new Headers(init?.headers);
+  return headers.has("x-andes-admin-token") || headers.has("authorization");
+}
+
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const apiBase = getApiBase();
+  const candidates = hasSensitiveHeaders(init) ? [apiBase] : getFallbackApiBases(apiBase);
   const attempted: string[] = [];
-  for (const candidate of getFallbackApiBases(apiBase)) {
+  for (const candidate of candidates) {
     attempted.push(candidate);
     try {
       return await fetch(`${candidate}${path}`, init);

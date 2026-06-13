@@ -29,6 +29,10 @@ def _settings_with_aliases(tmp_path: Path) -> AndesSettings:
     return settings.model_copy(update={"alias_path": FIXTURES / "mini_aliases.tsv"})
 
 
+def _loopback_client(app) -> TestClient:
+    return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
+
+
 def test_health_endpoint():
     client = TestClient(create_app())
     response = client.get("/health")
@@ -37,7 +41,7 @@ def test_health_endpoint():
 
 
 def test_data_status_reports_cache_without_requiring_it_for_readiness():
-    client = TestClient(create_app())
+    client = _loopback_client(create_app())
     response = client.get("/data/status")
     assert response.status_code == 200
     payload = response.json()
@@ -268,6 +272,29 @@ def test_admin_token_protects_admin_endpoints(tmp_path):
     assert status_allowed.status_code == 200
 
 
+def test_admin_without_token_rejects_forwarded_loopback_request(tmp_path):
+    client = _loopback_client(create_app(_settings(tmp_path)))
+
+    response = client.get("/admin/queue", headers={"x-forwarded-for": "203.0.113.10"})
+
+    assert response.status_code == 403
+    assert "admin token required" in response.json()["detail"]
+
+
+def test_admin_without_token_rejects_non_loopback_host(tmp_path):
+    app = create_app(_settings(tmp_path))
+    client = TestClient(
+        app,
+        base_url="http://andes.example",
+        client=("127.0.0.1", 50000),
+    )
+
+    response = client.get("/data/status")
+
+    assert response.status_code == 403
+    assert "admin token required" in response.json()["detail"]
+
+
 def test_cross_owner_cancel_requires_admin_token(tmp_path):
     settings = _settings(tmp_path).model_copy(update={"admin_token": "secret"})
     app = create_app(settings)
@@ -291,7 +318,7 @@ def test_cross_owner_cancel_requires_admin_token(tmp_path):
 
 def test_admin_queue_and_recover_stale_endpoint(tmp_path):
     app = create_app(_settings(tmp_path))
-    client = TestClient(app)
+    client = _loopback_client(app)
     store = app.state.store
     job = store.create_job(AnalysisKind.SET_SIMILARITY, {"genes": ["A"]}, owner_key="ip:test")
     assert store.claim_next() is not None

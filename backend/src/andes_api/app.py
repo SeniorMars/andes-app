@@ -556,14 +556,36 @@ def _admin_token_from_request(request: Request) -> str | None:
     return None
 
 
-def _is_loopback_client(request: Request) -> bool:
-    host = request.client.host if request.client else ""
-    if host == "testclient":
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    normalized = host.strip().lower().rstrip(".")
+    if normalized == "localhost":
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        return ipaddress.ip_address(normalized).is_loopback
     except ValueError:
         return False
+
+
+def _has_forwarded_headers(request: Request) -> bool:
+    forwarded_headers = (
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+    )
+    return any(header in request.headers for header in forwarded_headers)
+
+
+def _is_loopback_admin_request(request: Request) -> bool:
+    client_host = request.client.host if request.client else None
+    return (
+        _is_loopback_host(client_host)
+        and _is_loopback_host(request.url.hostname)
+        and not _has_forwarded_headers(request)
+    )
 
 
 def _require_admin(request: Request, settings: AndesSettings) -> None:
@@ -572,7 +594,7 @@ def _require_admin(request: Request, settings: AndesSettings) -> None:
         if token and hmac.compare_digest(token, settings.admin_token):
             return
         raise HTTPException(status_code=403, detail="admin token required")
-    if _is_loopback_client(request):
+    if _is_loopback_admin_request(request):
         return
     raise HTTPException(status_code=403, detail="admin token required for remote admin access")
 
