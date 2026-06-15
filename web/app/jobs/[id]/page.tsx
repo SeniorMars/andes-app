@@ -1,9 +1,14 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { JobResponse, ResultTerm } from "@/lib/api";
-import { cancelJob, getDownloadUrl, getJob } from "@/lib/api";
+import {
+  cancelJob,
+  downloadJobArtifact,
+  getJob,
+  setStoredJobAccessToken
+} from "@/lib/api";
 
 function formatDate(value?: string | null): string {
   if (!value) return "Not started";
@@ -47,61 +52,230 @@ function exportSvg(svgId: string, filename: string) {
   URL.revokeObjectURL(url);
 }
 
+function csvSafe(value: string | number | boolean | null | undefined): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  const text = String(value);
+  if (/^[=+\-@]/.test(text.trimStart())) return `'${text}`;
+  return text;
+}
+
+function csvCell(value: string | number | boolean | null | undefined): string {
+  const text = csvSafe(value);
+  if (!/[",\n\r]/.test(text)) return text;
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function downloadText(filename: string, text: string, type: string) {
+  const blob = new Blob([text], { type });
+  downloadBlob(filename, blob);
+}
+
+function downloadBlob(filename: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function rowSearchText(row: ResultTerm): string {
+  return [
+    row.term,
+    row.description,
+    row.query_term,
+    row.query_description,
+    row.target_term,
+    row.target_description
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function rowSortLabel(row: ResultTerm): string {
+  return row.query_term && row.target_term ? `${row.query_term} ${row.target_term}` : row.term;
+}
+
+function fdrValue(row: ResultTerm): number {
+  return typeof row.p_value_corrected === "number" && Number.isFinite(row.p_value_corrected)
+    ? row.p_value_corrected
+    : 1;
+}
+
+function exportResultRows(rows: ResultTerm[]) {
+  const header = [
+    "term",
+    "description",
+    "size",
+    "query_term",
+    "query_description",
+    "query_size",
+    "target_term",
+    "target_description",
+    "target_size",
+    "true_score",
+    "z_score",
+    "p_value",
+    "p_value_corrected",
+    "log10_p_value_corrected",
+    "significant"
+  ];
+  const csv = [
+    header.join(","),
+    ...rows.map((row) =>
+      [
+        row.term,
+        row.description,
+        row.size,
+        row.query_term,
+        row.query_description,
+        row.query_size,
+        row.target_term,
+        row.target_description,
+        row.target_size,
+        row.true_score,
+        row.z_score,
+        row.p_value,
+        row.p_value_corrected,
+        row.log10_p_value_corrected,
+        row.significant
+      ]
+        .map(csvCell)
+        .join(",")
+    )
+  ].join("\n");
+  downloadText("andes-filtered-results.csv", `${csv}\n`, "text/csv;charset=utf-8");
+}
+
 function ResultTable({ rows }: { rows: ResultTerm[] }) {
-  const hasPairs = rows.some((row) => row.query_term || row.target_term);
+  const [search, setSearch] = useState("");
+  const [maxFdr, setMaxFdr] = useState(1);
+  const [significantOnly, setSignificantOnly] = useState(false);
+  const [sortKey, setSortKey] = useState("fdr-asc");
+  const hasPairs = useMemo(() => rows.some((row) => row.query_term || row.target_term), [rows]);
+  const filteredRows = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    return [...rows]
+      .filter((row) => {
+        const fdr = fdrValue(row);
+        if (fdr > maxFdr) return false;
+        if (significantOnly && !row.significant) return false;
+        return !needle || rowSearchText(row).includes(needle);
+      })
+      .sort((a, b) => {
+        if (sortKey === "z-desc") return b.z_score - a.z_score;
+        if (sortKey === "z-asc") return a.z_score - b.z_score;
+        if (sortKey === "term-asc") return rowSortLabel(a).localeCompare(rowSortLabel(b));
+        return fdrValue(a) - fdrValue(b);
+      });
+  }, [maxFdr, rows, search, significantOnly, sortKey]);
+  const visibleRows = filteredRows.slice(0, 500);
   return (
-    <table>
-      <thead>
-        {hasPairs ? (
-          <tr>
-            <th>Query term</th>
-            <th>Target term</th>
-            <th>Z-score</th>
-            <th>FDR</th>
-            <th>Significant</th>
-          </tr>
-        ) : (
-          <tr>
-            <th>Term</th>
-            <th>Description</th>
-            <th>Z-score</th>
-            <th>FDR</th>
-            <th>Significant</th>
-          </tr>
-        )}
-      </thead>
-      <tbody>
-        {rows.slice(0, 100).map((row) => (
-          <tr key={row.term}>
-            {hasPairs ? (
-              <>
-                <td className="term-cell">
-                  <strong>{row.query_term ?? ""}</strong>
-                  {row.query_size ? <span>{row.query_size} genes</span> : null}
-                  {row.query_description ? <span>{row.query_description}</span> : null}
-                </td>
-                <td className="term-cell">
-                  <strong>{row.target_term ?? ""}</strong>
-                  {row.target_size ? <span>{row.target_size} genes</span> : null}
-                  {row.target_description ? <span>{row.target_description}</span> : null}
-                </td>
-              </>
-            ) : (
-              <>
-                <td className="term-cell">
-                  <strong>{row.term}</strong>
-                  {row.size ? <span>{row.size} genes</span> : null}
-                </td>
-                <td>{row.description ?? ""}</td>
-              </>
-            )}
-            <td className="mono">{formatScore(row.z_score)}</td>
-            <td className="mono">{formatPValue(row.p_value_corrected)}</td>
-            <td>{row.significant ? "yes" : "no"}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <>
+      <div className="result-controls">
+        <label className="field">
+          <span>Search terms</span>
+          <input
+            placeholder="Term, description, query, target"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+        </label>
+        <label className="field">
+          <span>Max FDR: {maxFdr.toFixed(2)}</span>
+          <input
+            max={1}
+            min={0}
+            step={0.01}
+            type="range"
+            value={maxFdr}
+            onChange={(event) => setMaxFdr(Number(event.target.value))}
+          />
+        </label>
+        <label className="field">
+          <span>Sort</span>
+          <select value={sortKey} onChange={(event) => setSortKey(event.target.value)}>
+            <option value="fdr-asc">FDR ascending</option>
+            <option value="z-desc">Z-score descending</option>
+            <option value="z-asc">Z-score ascending</option>
+            <option value="term-asc">Term A-Z</option>
+          </select>
+        </label>
+        <label className="check-row">
+          <input
+            checked={significantOnly}
+            type="checkbox"
+            onChange={(event) => setSignificantOnly(event.target.checked)}
+          />
+          <span>Significant only</span>
+        </label>
+        <button
+          className="button secondary"
+          disabled={!filteredRows.length}
+          type="button"
+          onClick={() => exportResultRows(filteredRows)}
+        >
+          Export filtered CSV
+        </button>
+      </div>
+      <p className="subtle">
+        Showing {visibleRows.length} of {filteredRows.length} filtered rows from {rows.length} total.
+      </p>
+      <table>
+        <thead>
+          {hasPairs ? (
+            <tr>
+              <th>Query term</th>
+              <th>Target term</th>
+              <th>Z-score</th>
+              <th>FDR</th>
+              <th>Significant</th>
+            </tr>
+          ) : (
+            <tr>
+              <th>Term</th>
+              <th>Description</th>
+              <th>Z-score</th>
+              <th>FDR</th>
+              <th>Significant</th>
+            </tr>
+          )}
+        </thead>
+        <tbody>
+          {visibleRows.map((row, index) => (
+            <tr key={`${row.term}-${row.query_term ?? ""}-${row.target_term ?? ""}-${index}`}>
+              {hasPairs ? (
+                <>
+                  <td className="term-cell">
+                    <strong>{row.query_term ?? ""}</strong>
+                    {row.query_size ? <span>{row.query_size} genes</span> : null}
+                    {row.query_description ? <span>{row.query_description}</span> : null}
+                  </td>
+                  <td className="term-cell">
+                    <strong>{row.target_term ?? ""}</strong>
+                    {row.target_size ? <span>{row.target_size} genes</span> : null}
+                    {row.target_description ? <span>{row.target_description}</span> : null}
+                  </td>
+                </>
+              ) : (
+                <>
+                  <td className="term-cell">
+                    <strong>{row.term}</strong>
+                    {row.size ? <span>{row.size} genes</span> : null}
+                  </td>
+                  <td>{row.description ?? ""}</td>
+                </>
+              )}
+              <td className="mono">{formatScore(row.z_score)}</td>
+              <td className="mono">{formatPValue(row.p_value_corrected)}</td>
+              <td>{row.significant ? "yes" : "no"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
   );
 }
 
@@ -142,6 +316,16 @@ function readMapping(result: JobResponse["result"]): MappingSummary | null {
   const genes = mapping.genes;
   if (!genes || typeof genes !== "object") return null;
   return genes as MappingSummary;
+}
+
+function hasMappingReport(result: JobResponse["result"]): boolean {
+  const idMapping = result?.parameters.id_mapping;
+  if (!idMapping || typeof idMapping !== "object") return false;
+  return Object.values(idMapping).some((payload) => {
+    if (!payload || typeof payload !== "object") return false;
+    const records = (payload as { records?: unknown }).records;
+    return Array.isArray(records) && records.some((record) => record && typeof record === "object");
+  });
 }
 
 function readCache(result: JobResponse["result"]): CacheProfile | null {
@@ -501,21 +685,36 @@ function PairNetwork({ rows, jobId }: { rows: ResultTerm[]; jobId: string }) {
 
 function DownloadLinks({
   jobId,
-  collectionMode
+  collectionMode,
+  hasMapping
 }: {
   jobId: string;
   collectionMode: boolean;
+  hasMapping: boolean;
 }) {
-  const links = [
+  const [downloading, setDownloading] = useState("");
+  const [downloadError, setDownloadError] = useState("");
+  const links: Array<[string, string]> = [
     ["results.json", "JSON"],
     ["results.csv", "Results CSV"],
-    ...(collectionMode
-      ? [
-          ["pair-table.csv", "Full pair table"],
-          ["matrix.csv", "Z-score matrix"]
-        ]
-      : [])
+    ["report.zip", "Report ZIP"]
   ];
+  if (hasMapping) links.splice(2, 0, ["mapping-report.csv", "Mapping report"]);
+  if (collectionMode) {
+    links.push(["pair-table.csv", "Full pair table"], ["matrix.csv", "Z-score matrix"]);
+  }
+  async function handleDownload(filename: string) {
+    setDownloading(filename);
+    setDownloadError("");
+    try {
+      const artifact = await downloadJobArtifact(jobId, filename);
+      downloadBlob(artifact.filename, artifact.blob);
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : "Download failed");
+    } finally {
+      setDownloading("");
+    }
+  }
   return (
     <section className="panel pad">
       <div className="section-head">
@@ -526,15 +725,18 @@ function DownloadLinks({
       </div>
       <div className="download-row">
         {links.map(([filename, label]) => (
-          <a
+          <button
             className="button secondary"
-            href={getDownloadUrl(jobId, filename)}
+            disabled={downloading === filename}
             key={filename}
+            onClick={() => void handleDownload(filename)}
+            type="button"
           >
-            {label}
-          </a>
+            {downloading === filename ? "Downloading..." : label}
+          </button>
         ))}
       </div>
+      {downloadError ? <p className="form-error">{downloadError}</p> : null}
     </section>
   );
 }
@@ -544,12 +746,28 @@ export default function JobPage() {
   const [jobResponse, setJobResponse] = useState<JobResponse | null>(null);
   const [error, setError] = useState("");
   const [cancelling, setCancelling] = useState(false);
+  const urlTokenRef = useRef<{ jobId: string; token: string } | null>(null);
 
   useEffect(() => {
     let active = true;
+    const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
+    if (urlToken) {
+      urlTokenRef.current = { jobId: params.id, token: urlToken };
+      setStoredJobAccessToken(params.id, urlToken);
+      const url = new URL(window.location.href);
+      url.searchParams.delete("token");
+      window.history.replaceState(
+        null,
+        "",
+        `${url.pathname}${url.search}${url.hash}`
+      );
+    }
+    const rememberedToken =
+      urlTokenRef.current?.jobId === params.id ? urlTokenRef.current.token : undefined;
+    const accessToken = urlToken || rememberedToken;
     async function poll() {
       try {
-        const data = await getJob(params.id);
+        const data = await getJob(params.id, accessToken || undefined);
         if (!active) return;
         setJobResponse(data);
         if (data.job.state === "queued" || data.job.state === "running") {
@@ -575,6 +793,7 @@ export default function JobPage() {
   const { job, result } = jobResponse;
   const collectionMode = result?.parameters.mode === "gene_set_collection";
   const geneMapping = readMapping(result);
+  const mappingReportAvailable = hasMappingReport(result);
   const cache = readCache(result);
   const timing = readTiming(result);
   const canCancel = job.state === "queued" || job.state === "running";
@@ -674,7 +893,11 @@ export default function JobPage() {
               </div>
 
               {job.state === "succeeded" ? (
-                <DownloadLinks jobId={job.id} collectionMode={collectionMode} />
+                <DownloadLinks
+                  jobId={job.id}
+                  collectionMode={collectionMode}
+                  hasMapping={mappingReportAvailable}
+                />
               ) : null}
 
               {cache ? <CacheTransparency cache={cache} timing={timing} /> : null}
@@ -729,7 +952,7 @@ export default function JobPage() {
                     <p className="eyebrow">Top terms</p>
                     <h2>Results</h2>
                   </div>
-                  <span className="subtle">Showing first 100 rows</span>
+                  <span className="subtle">Filter, sort, and export current rows</span>
                 </div>
                 <div className="table-wrap">
                   <ResultTable rows={result.results} />

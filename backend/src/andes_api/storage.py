@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import secrets
 import shutil
 import sqlite3
 import uuid
@@ -11,6 +14,20 @@ from pathlib import Path
 from typing import Any
 
 from andes_core.schemas import AnalysisKind, JobRecord, JobState
+
+
+def generate_access_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def hash_access_token(token: str, token_hash_secret: str | None = None) -> str:
+    if token_hash_secret and token_hash_secret.strip():
+        return hmac.new(
+            token_hash_secret.strip().encode("utf-8"),
+            token.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def now_iso() -> str:
@@ -39,9 +56,15 @@ class StaleRecoveryResult:
 
 
 class JobStore:
-    def __init__(self, sqlite_path: Path, runs_dir: Path):
+    def __init__(
+        self,
+        sqlite_path: Path,
+        runs_dir: Path,
+        token_hash_secret: str | None = None,
+    ):
         self.sqlite_path = sqlite_path.expanduser().resolve()
         self.runs_dir = runs_dir.expanduser().resolve()
+        self.token_hash_secret = token_hash_secret.strip() if token_hash_secret else None
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.init_db()
@@ -51,6 +74,7 @@ class JobStore:
         conn = sqlite3.connect(self.sqlite_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
             conn.commit()
@@ -59,6 +83,7 @@ class JobStore:
 
     def init_db(self) -> None:
         with self.connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -70,12 +95,21 @@ class JobStore:
                     finished_at TEXT,
                     cancelled_at TEXT,
                     owner_key TEXT,
+                    access_token_hash TEXT,
                     error TEXT
                 )
                 """
             )
             self._ensure_column(conn, "cancelled_at", "TEXT")
             self._ensure_column(conn, "owner_key", "TEXT")
+            self._ensure_column(conn, "access_token_hash", "TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_state_created_at "
+                "ON jobs (state, created_at, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_owner_state ON jobs (owner_key, state)"
+            )
 
     def _ensure_column(self, conn: sqlite3.Connection, name: str, column_type: str) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
@@ -90,6 +124,7 @@ class JobStore:
         files: dict[str, str] | None = None,
         path_fields: dict[str, str] | None = None,
         owner_key: str | None = None,
+        access_token: str | None = None,
     ) -> JobRecord:
         job_id = uuid.uuid4().hex
         run_dir = self.run_dir(job_id)
@@ -103,13 +138,23 @@ class JobStore:
             payload[field] = str((run_dir / relative_path).resolve())
         (run_dir / "input.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         created_at = now_iso()
+        access_token_hash = (
+            hash_access_token(access_token, self.token_hash_secret) if access_token else None
+        )
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO jobs (id, kind, state, created_at, owner_key)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO jobs (id, kind, state, created_at, owner_key, access_token_hash)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, kind.value, JobState.QUEUED.value, created_at, owner_key),
+                (
+                    job_id,
+                    kind.value,
+                    JobState.QUEUED.value,
+                    created_at,
+                    owner_key,
+                    access_token_hash,
+                ),
             )
         return JobRecord(
             id=job_id,
@@ -117,6 +162,19 @@ class JobStore:
             state=JobState.QUEUED,
             created_at=created_at,
             owner_key=owner_key,
+        )
+
+    def verify_access_token(self, job_id: str, token: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT access_token_hash FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None or not row["access_token_hash"]:
+            return False
+        return hmac.compare_digest(
+            row["access_token_hash"],
+            hash_access_token(token, self.token_hash_secret),
         )
 
     def get_job(self, job_id: str) -> JobRecord | None:

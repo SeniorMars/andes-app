@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from andes_core.io import (
+    _load_embedding_cached,
     clean_gene_list,
     go_obo_annotations_to_gmt_text,
+    load_embedding,
     parse_gene_lines,
     parse_obo_text,
     parse_ranked_text,
@@ -102,3 +104,53 @@ def test_go_obo_annotations_to_gmt_text_propagates_to_parents():
     assert "GO:0000001\troot\tA\tB" in gmt
     assert "GO:0000002\tchild\tA\tB" in gmt
     assert mapping.mapped == ["A", "B"]
+
+
+class CountingNormalizer:
+    def __init__(self):
+        self.calls = 0
+
+    def l2_normalize_rows(self, raw):
+        self.calls += 1
+        return raw
+
+
+def test_load_embedding_reuses_cached_normalized_matrix(tmp_path):
+    embedding_path = tmp_path / "embedding.csv"
+    gene_list_path = tmp_path / "genes.txt"
+    embedding_path.write_text("1,0\n0,1\n", encoding="utf-8")
+    gene_list_path.write_text("A\nB\n", encoding="utf-8")
+    normalizer = CountingNormalizer()
+
+    first_matrix, first_genes = load_embedding(embedding_path, gene_list_path, normalizer)
+    second_matrix, second_genes = load_embedding(embedding_path, gene_list_path, normalizer)
+
+    assert normalizer.calls == 1
+    assert first_matrix is second_matrix
+    assert first_matrix.flags.writeable is False
+    assert first_genes == ["A", "B"]
+    assert second_genes == ["A", "B"]
+    assert first_genes is not second_genes
+    with pytest.raises(ValueError):
+        first_matrix[0, 0] = 99
+
+
+def test_load_embedding_cache_keeps_at_most_two_matrices():
+    assert _load_embedding_cached.cache_info().maxsize == 2
+
+
+def test_load_embedding_cache_invalidates_when_source_metadata_changes(tmp_path):
+    embedding_path = tmp_path / "embedding.csv"
+    gene_list_path = tmp_path / "genes.txt"
+    embedding_path.write_text("1,0\n0,1\n", encoding="utf-8")
+    gene_list_path.write_text("A\nB\n", encoding="utf-8")
+    normalizer = CountingNormalizer()
+
+    load_embedding(embedding_path, gene_list_path, normalizer)
+    embedding_path.write_text("1,0\n0,1\n1,1\n", encoding="utf-8")
+    gene_list_path.write_text("A\nB\nC\n", encoding="utf-8")
+    matrix, genes = load_embedding(embedding_path, gene_list_path, normalizer)
+
+    assert normalizer.calls == 2
+    assert matrix.shape == (3, 2)
+    assert genes == ["A", "B", "C"]

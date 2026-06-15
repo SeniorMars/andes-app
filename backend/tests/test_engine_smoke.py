@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -11,7 +12,9 @@ from andes_core.schemas import AnalysisKind, GseaRequest, SetSimilarityRequest
 
 ROOT = Path(__file__).resolve().parent
 FIXTURES = ROOT / "fixtures"
-ORIGINAL_SRC = Path("/Users/charlie/Acdemica/ylab/ANDES/src")
+ORIGINAL_SRC = Path(
+    os.environ.get("ANDES_ORIGINAL_SRC", Path.home() / "Acdemica/ylab/ANDES/src")
+)
 
 
 @pytest.mark.skipif(not ORIGINAL_SRC.exists(), reason="original ANDES source not available")

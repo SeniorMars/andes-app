@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from andes_core.config import AndesSettings
 from andes_core.io import parse_ranked_text
 
-ANDES_ROOT = Path("/Users/charlie/Acdemica/ylab/ANDES")
+ANDES_ROOT = Path(os.environ.get("ANDES_ORIGINAL_ROOT", Path.home() / "Acdemica/ylab/ANDES"))
 EMBEDDING = ANDES_ROOT / "data/embedding/node2vec_consensus.csv"
 GENE_LIST = ANDES_ROOT / "data/embedding/consensus_node.txt"
 GENE_SET = ANDES_ROOT / "data/gene_sets/hsa_experimental_eval_BP_propagated.gmt"
@@ -38,13 +39,17 @@ BENCHMARK_GSEA_EXAMPLE = [
 DATA_AVAILABLE = all(path.exists() for path in [EMBEDDING, GENE_LIST, GENE_SET, RANKED_LIST])
 
 
-@pytest.mark.skipif(not DATA_AVAILABLE, reason="original ANDES benchmark data not available")
-def test_default_paths_follow_run_benchmarks_inputs():
+def test_default_paths_are_repo_relative_mount_paths():
     settings = AndesSettings()
 
-    assert settings.embedding_path == EMBEDDING
-    assert settings.gene_list_path == GENE_LIST
-    assert settings.default_gene_set_path == GENE_SET
+    assert settings.original_src == Path("../andes-original/src")
+    assert settings.embedding_path == Path(
+        "../andes-original/data/embedding/node2vec_consensus.csv"
+    )
+    assert settings.gene_list_path == Path("../andes-original/data/embedding/consensus_node.txt")
+    assert settings.default_gene_set_path == Path(
+        "../andes-original/data/gene_sets/hsa_experimental_eval_BP_propagated.gmt"
+    )
     assert settings.null_iterations == 1000
     assert settings.seed is None
 

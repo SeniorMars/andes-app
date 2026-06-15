@@ -2,34 +2,67 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from andes_api.storage import JobStore
 from andes_core.config import get_settings
 from andes_core.engine import AndesEngine
-from andes_core.schemas import AnalysisKind, GseaRequest, SetSimilarityRequest
+from andes_core.schemas import AnalysisKind, GseaRequest, JobRecord, SetSimilarityRequest
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("andes_worker")
 
 
-def log_event(event: str, **fields: Any) -> None:
-    logger.info(json.dumps({"event": event, **fields}, sort_keys=True))
+def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
+    logger.log(level, json.dumps({"event": event, **fields}, sort_keys=True))
+
+
+def effective_parallelism(job_concurrency: int, workers_per_job: int) -> int:
+    return max(1, job_concurrency) * max(1, workers_per_job)
 
 
 class Worker:
     def __init__(self):
         self.settings = get_settings()
-        self.store = JobStore(self.settings.sqlite_path, self.settings.runs_dir)
-        self.engine = AndesEngine(self.settings)
+        self.store = JobStore(
+            self.settings.sqlite_path,
+            self.settings.runs_dir,
+            token_hash_secret=self.settings.token_hash_secret,
+        )
+        self.job_concurrency = max(1, self.settings.job_concurrency)
+        self._warn_if_oversubscribed()
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.job_concurrency,
+            thread_name_prefix="andes-worker",
+        )
+        self.futures: set[Future[bool]] = set()
         self.running = True
 
     def stop(self, *_args) -> None:
         self.running = False
 
-    def run_once(self) -> bool:
+    def _warn_if_oversubscribed(self) -> None:
+        cpu_count = os.cpu_count()
+        if cpu_count is None or cpu_count < 1:
+            return
+        workers_per_job = max(1, self.settings.workers)
+        effective_slots = effective_parallelism(self.job_concurrency, workers_per_job)
+        if effective_slots <= cpu_count:
+            return
+        log_event(
+            "worker_parallelism_exceeds_cpu",
+            level=logging.WARNING,
+            job_concurrency=self.job_concurrency,
+            workers_per_job=workers_per_job,
+            effective_parallelism=effective_slots,
+            cpu_count=cpu_count,
+        )
+
+    def _recover_stale_jobs(self) -> None:
         recovered = self.store.recover_stale_running(
             timeout_seconds=self.settings.running_job_timeout_seconds
         )
@@ -39,21 +72,21 @@ class Worker:
                 recovered_jobs=recovered.recovered_jobs,
                 recovered_ids=recovered.recovered_ids,
             )
-        job = self.store.claim_next()
-        if job is None:
-            return False
+
+    def _run_job(self, job: JobRecord) -> bool:
         started = time.perf_counter()
         log_event("job_started", job_id=job.id, kind=job.kind.value)
         try:
             payload = self.store.read_input(job.id)
             artifact_dir = self.store.run_dir(job.id) / "downloads"
+            engine = AndesEngine(self.settings)
             if job.kind == AnalysisKind.SET_SIMILARITY:
-                result = self.engine.run_set_similarity(
+                result = engine.run_set_similarity(
                     SetSimilarityRequest.model_validate(payload),
                     artifact_dir=artifact_dir,
                 )
             elif job.kind == AnalysisKind.GSEA:
-                result = self.engine.run_gsea(
+                result = engine.run_gsea(
                     GseaRequest.model_validate(payload),
                     artifact_dir=artifact_dir,
                 )
@@ -101,13 +134,49 @@ class Worker:
             )
         return True
 
+    def _drain_finished(self) -> int:
+        completed = 0
+        for future in list(self.futures):
+            if not future.done():
+                continue
+            self.futures.remove(future)
+            completed += 1
+            try:
+                future.result()
+            except Exception as exc:  # pragma: no cover - _run_job catches job failures.
+                log_event("worker_task_failed", error=f"{type(exc).__name__}: {exc}")
+        return completed
+
+    def _claim_available_jobs(self) -> int:
+        claimed = 0
+        while self.running and len(self.futures) < self.job_concurrency:
+            job = self.store.claim_next()
+            if job is None:
+                break
+            self.futures.add(self.executor.submit(self._run_job, job))
+            claimed += 1
+        return claimed
+
+    def run_once(self) -> bool:
+        completed = self._drain_finished()
+        if not self.futures:
+            self._recover_stale_jobs()
+        claimed = self._claim_available_jobs()
+        return completed > 0 or claimed > 0
+
+    def close(self, *, wait: bool = True) -> None:
+        self.executor.shutdown(wait=wait)
+
     def run_forever(self, poll_seconds: float = 1.0) -> None:
         signal.signal(signal.SIGINT, self.stop)
         signal.signal(signal.SIGTERM, self.stop)
-        while self.running:
-            did_work = self.run_once()
-            if not did_work:
-                time.sleep(poll_seconds)
+        try:
+            while self.running:
+                did_work = self.run_once()
+                if not did_work:
+                    time.sleep(poll_seconds)
+        finally:
+            self.close()
 
 
 def main() -> None:

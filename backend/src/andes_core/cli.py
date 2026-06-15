@@ -109,7 +109,11 @@ def prune_jobs_command(
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     settings = AndesSettings()
-    store = JobStore(settings.sqlite_path, settings.runs_dir)
+    store = JobStore(
+        settings.sqlite_path,
+        settings.runs_dir,
+        token_hash_secret=settings.token_hash_secret,
+    )
     result = store.prune_finished_jobs(
         max_age_days=max_age_days if max_age_days is not None else settings.job_max_age_days,
         min_keep_jobs=min_keep_jobs if min_keep_jobs is not None else settings.job_min_keep,
@@ -123,7 +127,11 @@ def cleanup_command(
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     settings = AndesSettings()
-    store = JobStore(settings.sqlite_path, settings.runs_dir)
+    store = JobStore(
+        settings.sqlite_path,
+        settings.runs_dir,
+        token_hash_secret=settings.token_hash_secret,
+    )
     cache_result = prune_cache(
         settings.cache_dir,
         max_age_days=settings.cache_max_age_days,

@@ -5,7 +5,8 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "ANDES v2",
-  description: "ANDES set similarity and GSEA prototype"
+  description: "ANDES set similarity and GSEA prototype",
+  referrer: "no-referrer"
 };
 
 const themeScript = `
@@ -24,6 +25,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" data-theme="dark" suppressHydrationWarning>
       <head>
+        <meta name="referrer" content="no-referrer" />
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
       <body suppressHydrationWarning>
@@ -42,6 +44,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 <Link href="/about">About</Link>
                 <Link href="/set-similarity">Set Similarity</Link>
                 <Link href="/gsea">GSEA</Link>
+                <Link href="/jobs">My Jobs</Link>
                 <Link href="/admin">Admin</Link>
               </nav>
               <ThemeToggle />

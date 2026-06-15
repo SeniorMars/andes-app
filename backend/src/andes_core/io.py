@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
@@ -139,6 +140,38 @@ def parse_ranked_text(text: str) -> list[tuple[str, float]]:
 def load_gene_ids(path: Path) -> set[str]:
     with path.open(encoding="utf-8") as handle:
         return {line.strip() for line in handle if line.strip()}
+
+
+class FileCacheKey(NamedTuple):
+    path: str
+    mtime_ns: int
+    size: int
+
+
+def _file_cache_key(path: Path) -> FileCacheKey:
+    resolved = path.expanduser().resolve()
+    stat = resolved.stat()
+    return FileCacheKey(path=str(resolved), mtime_ns=stat.st_mtime_ns, size=stat.st_size)
+
+
+@lru_cache(maxsize=2)
+def _load_embedding_cached(
+    embedding_key: FileCacheKey,
+    gene_list_key: FileCacheKey,
+    normalize_rows: Callable[[np.ndarray], np.ndarray],
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    raw = np.loadtxt(embedding_key.path, delimiter=",", dtype=np.float32)
+    if raw.ndim == 1:
+        raw = raw.reshape(1, -1)
+    with Path(gene_list_key.path).open(encoding="utf-8") as handle:
+        genes = tuple(line.strip() for line in handle if line.strip())
+    if len(genes) != raw.shape[0]:
+        raise ValueError(
+            f"embedding row count ({raw.shape[0]}) does not match gene list ({len(genes)})"
+        )
+    matrix = np.ascontiguousarray(normalize_rows(raw), dtype=np.float32)
+    matrix.setflags(write=False)
+    return matrix, genes
 
 
 def load_alias_map(path: Path, known_genes: set[str]) -> dict[str, str]:
@@ -438,14 +471,9 @@ def go_obo_annotations_to_gmt_text(
 def load_embedding(
     embedding_path: Path, gene_list_path: Path, func_optimized
 ) -> tuple[np.ndarray, list[str]]:
-    raw = np.loadtxt(str(embedding_path), delimiter=",", dtype=np.float32)
-    if raw.ndim == 1:
-        raw = raw.reshape(1, -1)
-    with gene_list_path.open(encoding="utf-8") as handle:
-        genes = [line.strip() for line in handle if line.strip()]
-    if len(genes) != raw.shape[0]:
-        raise ValueError(
-            f"embedding row count ({raw.shape[0]}) does not match gene list ({len(genes)})"
-        )
-    matrix = np.ascontiguousarray(func_optimized.l2_normalize_rows(raw), dtype=np.float32)
-    return matrix, genes
+    matrix, genes = _load_embedding_cached(
+        _file_cache_key(embedding_path),
+        _file_cache_key(gene_list_path),
+        func_optimized.l2_normalize_rows,
+    )
+    return matrix, list(genes)

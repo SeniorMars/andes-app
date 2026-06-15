@@ -11,7 +11,7 @@ class AndesSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ANDES_", env_file=".env", extra="ignore")
 
     original_src: Path = Field(
-        default=Path("/Users/charlie/Acdemica/ylab/ANDES/src"),
+        default=Path("../andes-original/src"),
         description="Path to the optimized ANDES source directory.",
     )
     data_dir: Path = Field(default=Path("../data"), description="ANDES v2 data directory.")
@@ -20,14 +20,14 @@ class AndesSettings(BaseSettings):
     sqlite_path: Path = Field(default=Path("../runs/jobs.sqlite3"), description="Job DB path.")
 
     embedding_path: Path = Field(
-        default=Path("/Users/charlie/Acdemica/ylab/ANDES/data/embedding/node2vec_consensus.csv")
+        default=Path("../andes-original/data/embedding/node2vec_consensus.csv")
     )
     gene_list_path: Path = Field(
-        default=Path("/Users/charlie/Acdemica/ylab/ANDES/data/embedding/consensus_node.txt")
+        default=Path("../andes-original/data/embedding/consensus_node.txt")
     )
     default_gene_set_path: Path = Field(
         default=Path(
-            "/Users/charlie/Acdemica/ylab/ANDES/data/gene_sets/"
+            "../andes-original/data/gene_sets/"
             "hsa_experimental_eval_BP_propagated.gmt"
         )
     )
@@ -48,6 +48,9 @@ class AndesSettings(BaseSettings):
     max_jobs_per_owner: int = 10
     running_job_timeout_seconds: int = 21_600
     max_result_rows: int = 1000
+    preview_digest_secret: str | None = None
+    preview_digest_ttl_seconds: int = Field(default=900, ge=1)
+    token_hash_secret: str | None = None
     alias_path: Path | None = None
     cache_max_age_days: int = 30
     cache_min_keep_files: int = 8

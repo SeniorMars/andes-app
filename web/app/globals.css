@@ -83,6 +83,7 @@ a {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -357,6 +358,7 @@ button:disabled {
 }
 
 .field label,
+.field > span,
 .control-label {
   font-size: 13px;
   font-weight: 800;
@@ -368,7 +370,8 @@ button:disabled {
 }
 
 .field textarea,
-.field input {
+.field input,
+.field select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -387,7 +390,8 @@ button:disabled {
 }
 
 .field textarea:focus,
-.field input:focus {
+.field input:focus,
+.field select:focus {
   border-color: var(--teal);
   box-shadow: 0 0 0 3px rgba(0, 117, 111, 0.13);
 }
@@ -472,6 +476,86 @@ button:disabled {
 
 .note ul {
   padding-left: 18px;
+}
+
+.template-panel {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px;
+}
+
+.template-head h3,
+.template-head p,
+.template-item strong,
+.template-item span {
+  margin: 0;
+}
+
+.template-head h3 {
+  font-size: 14px;
+}
+
+.template-head p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.template-list {
+  display: grid;
+  gap: 10px;
+}
+
+.template-item {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  padding: 10px;
+}
+
+.template-item strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.template-item span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.template-item ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.template-warning {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  padding: 10px;
+}
+
+.template-warning p {
+  margin: 0;
+}
+
+.template-warning ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .row {
@@ -711,6 +795,48 @@ button:disabled {
   gap: 14px;
 }
 
+.history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-card {
+  display: grid;
+  gap: 14px;
+}
+
+.history-main,
+.history-actions,
+.history-meta {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.history-main h2 {
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+
+.history-meta {
+  justify-content: flex-start;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.history-fields {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.45fr) minmax(260px, 1fr);
+  gap: 10px;
+}
+
+.history-fields .field textarea {
+  min-height: 96px;
+  font-family: inherit;
+}
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -931,6 +1057,30 @@ button:disabled {
   overflow-x: auto;
 }
 
+.result-controls {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(150px, 0.45fr) minmax(170px, 0.45fr) auto auto;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.check-row {
+  display: inline-flex;
+  align-items: center;
+  min-height: 42px;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.check-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--teal);
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1097,6 +1247,8 @@ td.mono {
   .preview-grid,
   .config-grid,
   .summary-grid,
+  .history-fields,
+  .result-controls,
   .stat-strip,
   .method-steps {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1127,6 +1279,8 @@ td.mono {
   .mini-grid,
   .config-grid,
   .summary-grid,
+  .history-fields,
+  .result-controls,
   .stat-strip,
   .method-steps {
     grid-template-columns: 1fr;

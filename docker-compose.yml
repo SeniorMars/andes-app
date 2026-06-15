@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["uv", "run", "andes-api"]
+    restart: unless-stopped
     environment: &andes_env
       ANDES_ORIGINAL_SRC: /andes-original/src
       ANDES_API_HOST: 0.0.0.0
@@ -14,6 +15,7 @@ services:
       ANDES_RUNS_DIR: /app/runs
       ANDES_SQLITE_PATH: /app/runs/jobs.sqlite3
       ANDES_WORKERS: "${ANDES_WORKERS:-8}"
+      ANDES_JOB_CONCURRENCY: "${ANDES_JOB_CONCURRENCY:-1}"
       ANDES_NULL_ITERATIONS: "${ANDES_NULL_ITERATIONS:-1000}"
       ANDES_MAX_TERM_PAIRS: "${ANDES_MAX_TERM_PAIRS:-500000}"
       ANDES_MAX_UPLOAD_BYTES: "${ANDES_MAX_UPLOAD_BYTES:-10000000}"
@@ -22,11 +24,26 @@ services:
       ANDES_MAX_JOBS_PER_OWNER: "${ANDES_MAX_JOBS_PER_OWNER:-10}"
       ANDES_RUNNING_JOB_TIMEOUT_SECONDS: "${ANDES_RUNNING_JOB_TIMEOUT_SECONDS:-21600}"
       ANDES_ADMIN_TOKEN: "${ANDES_ADMIN_TOKEN:-}"
+      ANDES_TOKEN_HASH_SECRET: "${ANDES_TOKEN_HASH_SECRET:-}"
+      ANDES_PREVIEW_DIGEST_SECRET: "${ANDES_PREVIEW_DIGEST_SECRET:-}"
+      ANDES_PREVIEW_DIGEST_TTL_SECONDS: "${ANDES_PREVIEW_DIGEST_TTL_SECONDS:-900}"
       ANDES_TRUSTED_USER_HEADER: "${ANDES_TRUSTED_USER_HEADER:-}"
     ports:
       - "127.0.0.1:8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     volumes:
-      - "${ANDES_ORIGINAL_ROOT:-/Users/charlie/Acdemica/ylab/ANDES}:/andes-original:ro"
+      - "${ANDES_ORIGINAL_ROOT:?Set ANDES_ORIGINAL_ROOT in .env to your original ANDES checkout}:/andes-original:ro"
       - ./cache:/app/cache
       - ./runs:/app/runs
 
@@ -35,24 +52,40 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     command: ["uv", "run", "andes-worker"]
+    restart: unless-stopped
     environment: *andes_env
     volumes:
-      - "${ANDES_ORIGINAL_ROOT:-/Users/charlie/Acdemica/ylab/ANDES}:/andes-original:ro"
+      - "${ANDES_ORIGINAL_ROOT:?Set ANDES_ORIGINAL_ROOT in .env to your original ANDES checkout}:/andes-original:ro"
       - ./cache:/app/cache
       - ./runs:/app/runs
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   web:
     build:
       context: .
       dockerfile: web/Dockerfile
+    restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_URL: "${NEXT_PUBLIC_API_URL:-http://localhost:8000}"
     ports:
       - "127.0.0.1:3000:3000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000').then((r) => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1));",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   cleanup:
     build:
@@ -62,6 +95,6 @@ services:
     profiles: ["ops"]
     environment: *andes_env
     volumes:
-      - "${ANDES_ORIGINAL_ROOT:-/Users/charlie/Acdemica/ylab/ANDES}:/andes-original:ro"
+      - "${ANDES_ORIGINAL_ROOT:?Set ANDES_ORIGINAL_ROOT in .env to your original ANDES checkout}:/andes-original:ro"
       - ./cache:/app/cache
       - ./runs:/app/runs
