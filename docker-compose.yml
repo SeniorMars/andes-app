@@ -30,6 +30,13 @@ services:
       ANDES_PREVIEW_DIGEST_SECRET: "${ANDES_PREVIEW_DIGEST_SECRET:-}"
       ANDES_PREVIEW_DIGEST_TTL_SECONDS: "${ANDES_PREVIEW_DIGEST_TTL_SECONDS:-900}"
       ANDES_TRUSTED_USER_HEADER: "${ANDES_TRUSTED_USER_HEADER:-}"
+      ANDES_ALIAS_PATH: "${ANDES_ALIAS_PATH:-}"
+      ANDES_SPECIES: "${ANDES_SPECIES:-hsa}"
+      ANDES_CANONICAL_ID_NAMESPACE: "${ANDES_CANONICAL_ID_NAMESPACE:-entrez}"
+      ANDES_GENE_MAPPING_DIR: "${ANDES_GENE_MAPPING_DIR:-}"
+      ANDES_GENE_MAPPING_PATH: "${ANDES_GENE_MAPPING_PATH:-}"
+      ANDES_GENE_MAPPING_SQLITE_PATH: "${ANDES_GENE_MAPPING_SQLITE_PATH:-}"
+      ANDES_GENE_MAPPING_MIN_OVERLAP: "${ANDES_GENE_MAPPING_MIN_OVERLAP:-0.05}"
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -46,6 +53,7 @@ services:
       start_period: 10s
     volumes:
       - "${ANDES_ORIGINAL_ROOT:?Set ANDES_ORIGINAL_ROOT in .env to your original ANDES checkout}:/andes-original:ro"
+      - "${ANDES_GENE_MAPPING_HOST_DIR:-./gene_mappings}:/app/gene_mappings:ro"
       - ./cache:/app/cache
       - ./runs:/app/runs
 
@@ -58,6 +66,7 @@ services:
     environment: *andes_env
     volumes:
       - "${ANDES_ORIGINAL_ROOT:?Set ANDES_ORIGINAL_ROOT in .env to your original ANDES checkout}:/andes-original:ro"
+      - "${ANDES_GENE_MAPPING_HOST_DIR:-./gene_mappings}:/app/gene_mappings:ro"
       - ./cache:/app/cache
       - ./runs:/app/runs
     depends_on:
@@ -98,5 +107,6 @@ services:
     environment: *andes_env
     volumes:
       - "${ANDES_ORIGINAL_ROOT:?Set ANDES_ORIGINAL_ROOT in .env to your original ANDES checkout}:/andes-original:ro"
+      - "${ANDES_GENE_MAPPING_HOST_DIR:-./gene_mappings}:/app/gene_mappings:ro"
       - ./cache:/app/cache
       - ./runs:/app/runs

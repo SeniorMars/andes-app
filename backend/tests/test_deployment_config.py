@@ -24,6 +24,15 @@ def test_compose_passes_legacy_adapter_settings():
     assert 'ANDES_ORIGINAL_REVISION: "${ANDES_ORIGINAL_REVISION:-}"' in compose
 
 
+def test_compose_passes_gene_mapping_settings():
+    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert 'ANDES_SPECIES: "${ANDES_SPECIES:-hsa}"' in compose
+    assert 'ANDES_GENE_MAPPING_DIR: "${ANDES_GENE_MAPPING_DIR:-}"' in compose
+    assert 'ANDES_GENE_MAPPING_SQLITE_PATH: "${ANDES_GENE_MAPPING_SQLITE_PATH:-}"' in compose
+    assert "${ANDES_GENE_MAPPING_HOST_DIR:-./gene_mappings}:/app/gene_mappings:ro" in compose
+
+
 def test_env_example_leaves_compose_original_root_blank():
     env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
 
