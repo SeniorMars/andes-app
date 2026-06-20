@@ -1,6 +1,9 @@
 backend/.venv/
 .env
 backend/.env
+.demo-env/
+.demo-logs/
+.demo-pids/
 andes-original
 gene_mappings/
 backend/.pytest_cache/

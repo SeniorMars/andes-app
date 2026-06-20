@@ -1,6 +1,9 @@
 .env
 .git/
 .uv-cache/
+.demo-env/
+.demo-logs/
+.demo-pids/
 andes-original
 gene_mappings/
 .mypy_cache/
