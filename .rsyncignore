@@ -1,5 +1,8 @@
 .env
 .git/
+.uv-cache/
+andes-original
+gene_mappings/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
