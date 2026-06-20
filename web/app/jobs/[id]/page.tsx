@@ -39,17 +39,43 @@ function formatSeconds(value?: number | null): string {
   return `${value.toFixed(value >= 10 ? 1 : 3)} s`;
 }
 
+const SVG_PRESENTATION_PROPERTIES = [
+  "color",
+  "fill",
+  "fill-opacity",
+  "font-family",
+  "font-size",
+  "font-weight",
+  "opacity",
+  "stroke",
+  "stroke-dasharray",
+  "stroke-linecap",
+  "stroke-linejoin",
+  "stroke-opacity",
+  "stroke-width",
+  "text-anchor"
+];
+
+function inlineSvgStyles(source: Element, clone: Element) {
+  const computed = window.getComputedStyle(source);
+  SVG_PRESENTATION_PROPERTIES.forEach((property) => {
+    const value = computed.getPropertyValue(property);
+    if (value) clone.setAttribute(property, value.trim());
+  });
+  Array.from(source.children).forEach((child, index) => {
+    const clonedChild = clone.children.item(index);
+    if (clonedChild) inlineSvgStyles(child, clonedChild);
+  });
+}
+
 function exportSvg(svgId: string, filename: string) {
   const svg = document.getElementById(svgId);
   if (!(svg instanceof SVGElement)) return;
-  const source = new XMLSerializer().serializeToString(svg);
-  const blob = new Blob([source], { type: "image/svg+xml;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
+  const clone = svg.cloneNode(true) as SVGElement;
+  clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  inlineSvgStyles(svg, clone);
+  const source = new XMLSerializer().serializeToString(clone);
+  downloadBlob(filename, new Blob([source], { type: "image/svg+xml;charset=utf-8" }));
 }
 
 function csvSafe(value: string | number | boolean | null | undefined): string {
@@ -281,9 +307,65 @@ function ResultTable({ rows }: { rows: ResultTerm[] }) {
 
 type MappingSummary = {
   mapped_count?: number;
+  submitted_record_count?: number;
+  unresolved_count?: number;
   unmapped_count?: number;
   unmapped_examples?: string[];
+  ambiguous_count?: number;
+  ambiguous_examples?: string[];
   id_type_counts?: Record<string, number>;
+  source_counts?: Record<string, number>;
+  mapping_provenance?: MappingProvenance;
+};
+
+type MappingProvenance = {
+  species?: string | null;
+  mapping_file?: string | null;
+  mapping_mtime_ns?: number | null;
+  mapping_size?: number | null;
+  mapping_sha256?: string | null;
+  gene_list_file?: string | null;
+  gene_list_mtime_ns?: number | null;
+  gene_list_size?: number | null;
+  sqlite_file?: string | null;
+  alias_rows?: number | null;
+};
+
+type MappingEntry = {
+  key: string;
+  label: string;
+  mapping: MappingSummary;
+};
+
+type GseaTracePoint = {
+  rank: number;
+  gene: string;
+  rank_score: number;
+  best_match_gene: string;
+  match_score: number;
+  centered_score: number;
+  running_es: number;
+};
+
+type GseaTraceTerm = {
+  term: string;
+  description?: string | null;
+  size?: number | null;
+  true_score?: number | null;
+  z_score?: number | null;
+  p_value_corrected?: number | null;
+  es?: number | null;
+  es_rank?: number | null;
+  sampled?: boolean;
+  points: GseaTracePoint[];
+};
+
+type GseaTrace = {
+  algorithm?: string;
+  exact?: boolean;
+  ranked_gene_count: number;
+  max_points_per_term?: number;
+  terms: GseaTraceTerm[];
 };
 
 type CacheProfile = {
@@ -306,16 +388,68 @@ type CacheProfile = {
 type TimingProfile = {
   cache?: number;
   scoring?: number;
+  trace?: number;
   total?: number;
 };
 
-function readMapping(result: JobResponse["result"]): MappingSummary | null {
+function mappingLabel(key: string): string {
+  if (key === "genes") return "Input genes";
+  if (key === "query_collection") return "Query collection";
+  if (key === "target_collection") return "Target collection";
+  return key.replaceAll("_", " ");
+}
+
+function readMappings(result: JobResponse["result"]): MappingEntry[] {
   const idMapping = result?.parameters.id_mapping;
-  if (!idMapping || typeof idMapping !== "object") return null;
-  const mapping = idMapping as Record<string, unknown>;
-  const genes = mapping.genes;
-  if (!genes || typeof genes !== "object") return null;
-  return genes as MappingSummary;
+  if (!idMapping || typeof idMapping !== "object") return [];
+  return Object.entries(idMapping as Record<string, unknown>)
+    .filter((entry): entry is [string, Record<string, unknown>] => {
+      const [, payload] = entry;
+      return Boolean(payload && typeof payload === "object");
+    })
+    .map(([key, payload]) => ({
+      key,
+      label: mappingLabel(key),
+      mapping: payload as MappingSummary
+    }));
+}
+
+function excludedGeneCount(
+  result: JobResponse["result"],
+  mappings: MappingEntry[]
+): number {
+  const genes = mappings.find((entry) => entry.key === "genes")?.mapping;
+  if (genes) {
+    if (typeof genes.unresolved_count === "number") return genes.unresolved_count;
+    return (genes.unmapped_count ?? 0) + (genes.ambiguous_count ?? 0);
+  }
+  return result?.invalid_genes.length ?? 0;
+}
+
+function readGseaTrace(result: JobResponse["result"]): GseaTrace | null {
+  const trace = result?.parameters.gsea_trace;
+  if (!trace || typeof trace !== "object") return null;
+  const payload = trace as { ranked_gene_count?: unknown; terms?: unknown };
+  if (typeof payload.ranked_gene_count !== "number" || !Array.isArray(payload.terms)) {
+    return null;
+  }
+  const terms = payload.terms.filter((term): term is GseaTraceTerm => {
+    if (!term || typeof term !== "object") return false;
+    const maybeTerm = term as { term?: unknown; points?: unknown };
+    return typeof maybeTerm.term === "string" && Array.isArray(maybeTerm.points);
+  });
+  if (!terms.length) return null;
+  return { ...(trace as GseaTrace), terms };
+}
+
+function hasMappingProvenance(result: JobResponse["result"]): boolean {
+  const idMapping = result?.parameters.id_mapping;
+  if (!idMapping || typeof idMapping !== "object") return false;
+  return Object.values(idMapping).some((payload) => {
+    if (!payload || typeof payload !== "object") return false;
+    const provenance = (payload as { mapping_provenance?: unknown }).mapping_provenance;
+    return Boolean(provenance && typeof provenance === "object");
+  });
 }
 
 function hasMappingReport(result: JobResponse["result"]): boolean {
@@ -323,8 +457,18 @@ function hasMappingReport(result: JobResponse["result"]): boolean {
   if (!idMapping || typeof idMapping !== "object") return false;
   return Object.values(idMapping).some((payload) => {
     if (!payload || typeof payload !== "object") return false;
-    const records = (payload as { records?: unknown }).records;
-    return Array.isArray(records) && records.some((record) => record && typeof record === "object");
+    const mapping = payload as {
+      mapping_report?: unknown;
+      records?: unknown;
+      submitted_record_count?: unknown;
+    };
+    if (mapping.mapping_report === "mapping-report.csv") return true;
+    if (typeof mapping.submitted_record_count === "number" && mapping.submitted_record_count > 0) {
+      return true;
+    }
+    return Array.isArray(mapping.records) && mapping.records.some((record) => {
+      return record && typeof record === "object";
+    });
   });
 }
 
@@ -471,6 +615,135 @@ function DotPlot({ rows, jobId }: { rows: ResultTerm[]; jobId: string }) {
             </circle>
           );
         })}
+      </svg>
+    </section>
+  );
+}
+
+function GseaRunningScorePlot({ trace, jobId }: { trace: GseaTrace; jobId: string }) {
+  const terms = trace.terms.filter((term) => term.points.length >= 2);
+  const [selectedTerm, setSelectedTerm] = useState(terms[0]?.term ?? "");
+  const selected = terms.find((term) => term.term === selectedTerm) ?? terms[0];
+  if (!selected) return null;
+  const points = [...selected.points].sort((a, b) => a.rank - b.rank);
+  const width = 820;
+  const height = 390;
+  const left = 54;
+  const right = 28;
+  const top = 42;
+  const esBottom = 246;
+  const scoreTop = 286;
+  const bottom = 346;
+  const maxRank = Math.max(trace.ranked_gene_count, ...points.map((point) => point.rank));
+  const runningValues = points.map((point) => point.running_es);
+  const scoreValues = points.map((point) => point.match_score);
+  const minEs = Math.min(...runningValues, 0);
+  const maxEs = Math.max(...runningValues, 0);
+  const minScore = Math.min(...scoreValues);
+  const maxScore = Math.max(...scoreValues);
+  const svgId = `gsea-running-${jobId}`;
+  const xFor = (rank: number) => chartScale(rank, 1, maxRank, left, width - right);
+  const esY = (value: number) => chartScale(value, minEs, maxEs, esBottom, top);
+  const scoreY = (value: number) => chartScale(value, minScore, maxScore, bottom, scoreTop);
+  const path = points
+    .map((point) => `${xFor(point.rank).toFixed(2)},${esY(point.running_es).toFixed(2)}`)
+    .join(" ");
+  const peak = points.reduce((best, point) => {
+    if (selected.es_rank && point.rank === selected.es_rank) return point;
+    return Math.abs(point.running_es) > Math.abs(best.running_es) ? point : best;
+  }, points[0]);
+  const title = selected.description || selected.term;
+  return (
+    <section className="panel pad chart-panel">
+      <div className="section-head">
+        <div>
+          <p className="eyebrow">GSEA trace</p>
+          <h2>Running score</h2>
+        </div>
+        <button
+          className="button secondary compact"
+          type="button"
+          onClick={() => exportSvg(svgId, `${jobId}-gsea-running-score.svg`)}
+        >
+          Export SVG
+        </button>
+      </div>
+      {terms.length > 1 ? (
+        <div className="segmented-row">
+          {terms.map((term) => (
+            <button
+              className={term.term === selected.term ? "segment active" : "segment"}
+              key={term.term}
+              type="button"
+              onClick={() => setSelectedTerm(term.term)}
+            >
+              {shortLabel(term.description || term.term, 28)}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      <svg
+        aria-label="GSEA running score plot"
+        className="svg-chart"
+        id={svgId}
+        role="img"
+        viewBox={`0 0 ${width} ${height}`}
+      >
+        <rect width={width} height={height} fill="var(--surface)" />
+        <line x1={left} x2={width - right} y1={esY(0)} y2={esY(0)} className="chart-axis soft" />
+        <line x1={left} x2={left} y1={top} y2={bottom} className="chart-axis" />
+        <line x1={left} x2={width - right} y1={esBottom} y2={esBottom} className="chart-axis" />
+        <line x1={left} x2={width - right} y1={bottom} y2={bottom} className="chart-axis" />
+        <text x={left} y={22} className="chart-title">
+          {shortLabel(title, 72)}
+        </text>
+        <text x={left} y={height - 14} className="chart-label">
+          {formatInteger(points.length)} sampled ranks of {formatInteger(trace.ranked_gene_count)};
+          peak rank {selected.es_rank ?? peak.rank}
+        </text>
+        <text x={width - right} y={22} className="chart-label align-end">
+          z {typeof selected.z_score === "number" ? formatScore(selected.z_score) : "NA"}; FDR{" "}
+          {typeof selected.p_value_corrected === "number"
+            ? formatPValue(selected.p_value_corrected)
+            : "NA"}
+        </text>
+        <text x={left} y={esBottom + 20} className="chart-label">
+          running ES
+        </text>
+        <text x={left} y={bottom + 22} className="chart-label">
+          best-match score
+        </text>
+        {points.map((point) => {
+          const x = xFor(point.rank);
+          return (
+            <line
+              className="gsea-match-bar"
+              key={`${point.rank}-${point.gene}`}
+              x1={x}
+              x2={x}
+              y1={bottom}
+              y2={scoreY(point.match_score)}
+            >
+              <title>
+                rank {point.rank}: {point.gene} best matches {point.best_match_gene}; score{" "}
+                {formatScore(point.match_score)}
+              </title>
+            </line>
+          );
+        })}
+        <polyline className="gsea-running-line" points={path} />
+        <line
+          className="gsea-peak-line"
+          x1={xFor(selected.es_rank ?? peak.rank)}
+          x2={xFor(selected.es_rank ?? peak.rank)}
+          y1={top}
+          y2={bottom}
+        />
+        <circle className="chart-point significant" cx={xFor(peak.rank)} cy={esY(peak.running_es)} r={4.5}>
+          <title>
+            ES peak rank {selected.es_rank ?? peak.rank}: {formatScore(peak.running_es)}
+          </title>
+        </circle>
       </svg>
     </section>
   );
@@ -686,11 +959,13 @@ function PairNetwork({ rows, jobId }: { rows: ResultTerm[]; jobId: string }) {
 function DownloadLinks({
   jobId,
   collectionMode,
-  hasMapping
+  hasMapping,
+  hasMappingProvenance
 }: {
   jobId: string;
   collectionMode: boolean;
   hasMapping: boolean;
+  hasMappingProvenance: boolean;
 }) {
   const [downloading, setDownloading] = useState("");
   const [downloadError, setDownloadError] = useState("");
@@ -700,6 +975,9 @@ function DownloadLinks({
     ["report.zip", "Report ZIP"]
   ];
   if (hasMapping) links.splice(2, 0, ["mapping-report.csv", "Mapping report"]);
+  if (hasMappingProvenance) {
+    links.splice(3, 0, ["mapping-provenance.json", "Mapping provenance"]);
+  }
   if (collectionMode) {
     links.push(["pair-table.csv", "Full pair table"], ["matrix.csv", "Z-score matrix"]);
   }
@@ -792,8 +1070,11 @@ export default function JobPage() {
 
   const { job, result } = jobResponse;
   const collectionMode = result?.parameters.mode === "gene_set_collection";
-  const geneMapping = readMapping(result);
+  const mappingSummaries = readMappings(result);
+  const excludedCount = excludedGeneCount(result, mappingSummaries);
+  const gseaTrace = readGseaTrace(result);
   const mappingReportAvailable = hasMappingReport(result);
+  const mappingProvenanceAvailable = hasMappingProvenance(result);
   const cache = readCache(result);
   const timing = readTiming(result);
   const canCancel = job.state === "queued" || job.state === "running";
@@ -879,7 +1160,7 @@ export default function JobPage() {
                   <span>{collectionMode ? "query terms" : "valid genes"}</span>
                 </div>
                 <div className="summary-card">
-                  <strong>{result.invalid_genes.length}</strong>
+                  <strong>{excludedCount}</strong>
                   <span>excluded genes</span>
                 </div>
                 <div className="summary-card">
@@ -897,12 +1178,13 @@ export default function JobPage() {
                   jobId={job.id}
                   collectionMode={collectionMode}
                   hasMapping={mappingReportAvailable}
+                  hasMappingProvenance={mappingProvenanceAvailable}
                 />
               ) : null}
 
               {cache ? <CacheTransparency cache={cache} timing={timing} /> : null}
 
-              {geneMapping ? (
+              {mappingSummaries.length ? (
                 <section className="panel pad">
                   <div className="section-head">
                     <div>
@@ -910,30 +1192,67 @@ export default function JobPage() {
                       <h2>Mapping summary</h2>
                     </div>
                   </div>
-                  <div className="preview-grid">
-                    <div className="preview-metric">
-                      <strong>{geneMapping.mapped_count ?? 0}</strong>
-                      <span>mapped submitted IDs</span>
+                  {mappingSummaries.map(({ key, label, mapping }) => (
+                    <div className="mapping-summary" key={key}>
+                      {mappingSummaries.length > 1 ? <h3>{label}</h3> : null}
+                      <div className="preview-grid">
+                        <div className="preview-metric">
+                          <strong>{mapping.mapped_count ?? 0}</strong>
+                          <span>mapped submitted IDs</span>
+                        </div>
+                        <div className="preview-metric">
+                          <strong>{mapping.unmapped_count ?? 0}</strong>
+                          <span>unmapped submitted IDs</span>
+                        </div>
+                        <div className="preview-metric">
+                          <strong>{mapping.ambiguous_count ?? 0}</strong>
+                          <span>ambiguous submitted IDs</span>
+                        </div>
+                      </div>
+                      {mapping.id_type_counts ? (
+                        <div className="chip-list compact">
+                          {Object.entries(mapping.id_type_counts).map(([idType, count]) => (
+                            <span key={idType}>
+                              {idType}: {count}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                      {mapping.source_counts ? (
+                        <div className="chip-list compact">
+                          {Object.entries(mapping.source_counts).map(([source, count]) => (
+                            <span key={source}>
+                              {source}: {count}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                      {mapping.ambiguous_examples?.length ? (
+                        <p className="subtle">
+                          Ambiguous examples: {mapping.ambiguous_examples.join(", ")}
+                        </p>
+                      ) : null}
+                      {mapping.mapping_provenance ? (
+                        <p className="subtle">
+                          Mapping snapshot: {mapping.mapping_provenance.mapping_file ?? "unknown"}
+                          {mapping.mapping_provenance.species
+                            ? ` (${mapping.mapping_provenance.species})`
+                            : ""}
+                          {typeof mapping.mapping_provenance.mapping_size === "number"
+                            ? `, ${formatInteger(mapping.mapping_provenance.mapping_size)} bytes`
+                            : ""}
+                          {mapping.mapping_provenance.mapping_sha256
+                            ? `, sha256 ${mapping.mapping_provenance.mapping_sha256.slice(0, 12)}`
+                            : ""}
+                        </p>
+                      ) : null}
+                      {mapping.unmapped_examples?.length ? (
+                        <p className="subtle">
+                          Unmapped examples: {mapping.unmapped_examples.join(", ")}
+                        </p>
+                      ) : null}
                     </div>
-                    <div className="preview-metric">
-                      <strong>{geneMapping.unmapped_count ?? 0}</strong>
-                      <span>unmapped submitted IDs</span>
-                    </div>
-                  </div>
-                  {geneMapping.id_type_counts ? (
-                    <div className="chip-list compact">
-                      {Object.entries(geneMapping.id_type_counts).map(([idType, count]) => (
-                        <span key={idType}>
-                          {idType}: {count}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-                  {geneMapping.unmapped_examples?.length ? (
-                    <p className="subtle">
-                      Unmapped examples: {geneMapping.unmapped_examples.join(", ")}
-                    </p>
-                  ) : null}
+                  ))}
                 </section>
               ) : null}
 
@@ -943,7 +1262,10 @@ export default function JobPage() {
                   <PairNetwork jobId={job.id} rows={result.results} />
                 </>
               ) : (
-                <DotPlot jobId={job.id} rows={result.results} />
+                <>
+                  {gseaTrace ? <GseaRunningScorePlot jobId={job.id} trace={gseaTrace} /> : null}
+                  <DotPlot jobId={job.id} rows={result.results} />
+                </>
               )}
 
               <section className="panel pad">

@@ -53,6 +53,12 @@ Useful environment variables:
 # Set these paths to your local checkout or mounted copy of the original ANDES data.
 ANDES_ORIGINAL_ROOT=/path/to/ANDES
 ANDES_ORIGINAL_SRC=/path/to/ANDES/src
+# Optional. Prefer this in production when the original ANDES code is packaged
+# as an adapter dependency instead of imported from a mutable source checkout.
+# The adapter module must expose load_data, func_optimized, and func_gsea.
+# ANDES_ORIGINAL_ADAPTER_MODULE=andes_original_adapter
+# Optional. Fail startup if the adapter/check-out reports a different revision.
+# ANDES_ORIGINAL_REVISION=<git-sha-or-adapter-revision>
 ANDES_API_HOST=127.0.0.1
 ANDES_API_PORT=8000
 ANDES_API_RELOAD=false
@@ -92,6 +98,13 @@ ANDES_JOB_MIN_KEEP=20
 # Optional. Only trust identity headers injected by your reverse proxy.
 # ANDES_TRUSTED_USER_HEADER=X-Authenticated-User
 ANDES_ALIAS_PATH=/path/to/gene_aliases.tsv
+# Preferred on horchata/shared deployments. Builds a local SQLite alias index
+# from the /grain mapping TSV and maps submitted IDs to Entrez IDs.
+ANDES_SPECIES=hsa
+ANDES_GENE_MAPPING_DIR=/grain/resources/gene_mappings/output/current
+# Optional override instead of ANDES_GENE_MAPPING_DIR + ANDES_SPECIES.
+# ANDES_GENE_MAPPING_PATH=/grain/resources/gene_mappings/output/current/hsa_mapping_all.txt
+# ANDES_GENE_MAPPING_SQLITE_PATH=../cache/gene_mappings_hsa.sqlite3
 ```
 
 See `.env.example` for the same settings in an environment-file format suitable
@@ -168,13 +181,57 @@ quickly because it scores `query_terms * target_terms`; keep
 wants to bypass the limit. `ANDES_MAX_UPLOAD_BYTES` and
 `ANDES_MAX_TERMS_PER_COLLECTION` protect upload size and parser load.
 
-Gene IDs are mapped to the configured embedding gene IDs before validation.
-Direct matches to `ANDES_GENE_LIST_PATH` always work. If `ANDES_ALIAS_PATH` is
-set, it should point to a TSV or CSV file where each row contains the canonical
-embedding gene ID plus one or more aliases. Headers such as `alias,gene` are
-ignored. The app detects common submitted ID shapes, including Entrez-like
-numbers, Ensembl IDs, UniProt-like IDs, and symbol-like values. Result JSON keeps
-the submitted ID, mapped ID, detected type, and mapping source.
+Gene IDs are mapped before validation. Direct matches to `ANDES_GENE_LIST_PATH`
+always work. For the current human embeddings, the gene list is Entrez-keyed, so
+shared deployments should set `ANDES_SPECIES=hsa` and `ANDES_GENE_MAPPING_DIR`
+to the `/grain` mapping directory, for example
+`/grain/resources/gene_mappings/output/current`. The app resolves
+`{ANDES_SPECIES}_mapping_all.txt`, so changing species to `mmu`, `dme`, and so
+on also changes the mapping file. The canonical namespace is explicit:
+`ANDES_CANONICAL_ID_NAMESPACE=entrez` is currently the only supported canonical
+ID type. `ANDES_GENE_MAPPING_PATH` remains available as an explicit override.
+Species is allowlisted to known organism codes, and the built mapping index must
+overlap at least `ANDES_GENE_MAPPING_MIN_OVERLAP` of the configured embedding
+gene list. On first use, the app builds
+`ANDES_GENE_MAPPING_SQLITE_PATH` as a local SQLite alias index filtered to Entrez
+IDs present in the embedding gene list. Submitted symbols, HGNC symbols,
+external synonyms, Ensembl IDs with version suffixes, and UniProt identifiers
+then resolve to Entrez IDs before queueing.
+The API owns a process-local `GeneMappingService`: startup validates or builds
+the SQLite index once, requests reuse the cached mapper for the same source
+manifest, and rebuilds take a cross-process `.lock` next to the SQLite file.
+Run `uv run andes validate-data` during deployment to exercise that same index
+validation before starting traffic.
+
+Previews and results include mapping-quality counts by source:
+`direct_entrez`, `gene_mapping`, `alias_file`, `unmapped`, and `ambiguous`.
+Ambiguous records are not guessed; the mapping record includes candidate Entrez
+IDs so users can inspect the conflict. To audit the configured mapping file,
+run:
+
+```bash
+cd backend
+uv run andes validate-gene-mapping
+```
+
+Result payloads and exports also include mapping provenance when a mapping file
+is configured: species, canonical namespace, mapping file basename, mtime, size,
+SHA-256 checksum, selected and ignored source columns, embedding gene-list
+metadata, SQLite index basename, alias-file checksum when configured, and alias
+row count. Full per-record mapping audits are written to `mapping-report.csv` as
+a job artifact; `results.json` keeps the summary counts and provenance. The
+report ZIP includes `mapping-provenance.json`; it is also available as a direct
+job download.
+
+GSEA results include sampled running-score trace data for the top terms. The
+web result page renders this as an exportable SVG with the running ES curve and
+best-match score bars, and report ZIPs include `figures/gsea-running-score.svg`
+when trace data are available.
+
+`ANDES_ALIAS_PATH` remains available as a simple fallback for small custom
+TSV/CSV files where each row contains the canonical embedding gene ID plus one or
+more aliases. Result JSON keeps the submitted ID, mapped ID, detected type,
+mapping source, source counts, and ambiguous candidates.
 
 GO/OBO support is real ontology support, not file-extension guessing. An OBO
 file defines GO terms and parent relationships; it does not contain gene

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import csv
 import json
 import logging
+import math
 import os
 import signal
 import time
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -15,6 +18,99 @@ from andes_core.schemas import AnalysisKind, GseaRequest, JobRecord, SetSimilari
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("andes_worker")
+
+
+def _mapping_report_rows(result: dict[str, Any]) -> list[list[object]]:
+    rows: list[list[object]] = [
+        [
+            "collection",
+            "submitted_id",
+            "mapped_id",
+            "detected_type",
+            "source",
+            "status",
+            "candidates",
+        ]
+    ]
+    parameters = result.get("parameters")
+    if not isinstance(parameters, dict):
+        return rows
+    id_mapping = parameters.get("id_mapping")
+    if not isinstance(id_mapping, dict):
+        return rows
+    for collection, payload in sorted(id_mapping.items()):
+        if not isinstance(payload, dict):
+            continue
+        records = payload.get("records")
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            mapped = record.get("mapped")
+            source = record.get("source", "")
+            candidates = record.get("candidates", [])
+            if not isinstance(candidates, list | tuple):
+                candidates = []
+            rows.append(
+                [
+                    collection,
+                    record.get("submitted", ""),
+                    mapped or "",
+                    record.get("id_type", ""),
+                    source,
+                    "mapped" if mapped else source if source == "ambiguous" else "unmapped",
+                    "|".join(str(candidate) for candidate in candidates),
+                ]
+            )
+    return rows
+
+
+def _write_csv(path, rows: list[list[object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerows(_csv_safe_row(row) for row in rows)
+
+
+def _csv_safe(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return value
+    text = str(value)
+    check = text.lstrip(" \t\r\n")
+    if check.startswith(("=", "+", "-", "@")):
+        return f"'{text}"
+    return text
+
+
+def _csv_safe_row(row: Iterable[object]) -> list[object]:
+    return [_csv_safe(value) for value in row]
+
+
+def _write_mapping_report_artifact(result: dict[str, Any], artifact_dir) -> None:
+    rows = _mapping_report_rows(result)
+    if len(rows) <= 1:
+        return
+    _write_csv(artifact_dir / "mapping-report.csv", rows)
+
+
+def _strip_mapping_records(result: dict[str, Any]) -> dict[str, Any]:
+    parameters = result.get("parameters")
+    if not isinstance(parameters, dict):
+        return result
+    id_mapping = parameters.get("id_mapping")
+    if not isinstance(id_mapping, dict):
+        return result
+    for payload in id_mapping.values():
+        if not isinstance(payload, dict):
+            continue
+        if payload.pop("records", None) is not None:
+            payload["mapping_report"] = "mapping-report.csv"
+    return result
 
 
 def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
@@ -100,7 +196,9 @@ class Worker:
                     elapsed_seconds=round(time.perf_counter() - started, 6),
                 )
                 return True
-            self.store.write_result(job.id, result.model_dump(mode="json"))
+            result_payload = result.model_dump(mode="json")
+            _write_mapping_report_artifact(result_payload, artifact_dir)
+            self.store.write_result(job.id, _strip_mapping_records(result_payload))
             marked = self.store.mark_succeeded(job.id)
             timing = result.parameters.get("timing_seconds", {})
             cache = result.parameters.get("cache", {})

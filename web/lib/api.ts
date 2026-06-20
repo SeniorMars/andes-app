@@ -48,15 +48,66 @@ export interface ResultTerm {
   significant: boolean;
 }
 
-export interface AnalysisResult {
+export interface BaseResultParameters extends Record<string, unknown> {
+  mode: "gene_list" | "gene_set_collection" | "ranked_enrichment";
+  min_gene_set_size?: number;
+  max_gene_set_size?: number;
+  null_iterations?: number;
+  workers?: number;
+  seed?: number | null;
+  seed_strategy?: string | null;
+  total_pairs?: number;
+  id_mapping?: Record<string, unknown>;
+  analysis_provenance?: Record<string, unknown>;
+  cache?: Record<string, unknown>;
+  timing_seconds?: Record<string, unknown>;
+}
+
+export interface GeneListResultParameters extends BaseResultParameters {
+  mode: "gene_list";
+  gene_set_path?: string;
+  target_term_count?: number;
+}
+
+export interface GeneSetCollectionResultParameters extends BaseResultParameters {
+  mode: "gene_set_collection";
+  query_gene_set_path?: string;
+  gene_set_path?: string;
+  query_term_count?: number;
+  target_term_count?: number;
+  returned_rows?: number;
+}
+
+export interface GseaResultParameters extends BaseResultParameters {
+  mode: "ranked_enrichment";
+  gene_set_path?: string;
+  target_term_count?: number;
+  gsea_trace?: Record<string, unknown> | null;
+}
+
+export type AnalysisResultParameters =
+  | GeneListResultParameters
+  | GeneSetCollectionResultParameters
+  | GseaResultParameters;
+
+export interface BaseAnalysisResult {
   kind: AnalysisKind;
   results: ResultTerm[];
   input_gene_count: number;
   valid_gene_count: number;
   invalid_genes: string[];
   warnings: string[];
-  parameters: Record<string, unknown>;
 }
+
+export type AnalysisResult =
+  | (BaseAnalysisResult & {
+      kind: "set_similarity";
+      parameters: GeneListResultParameters | GeneSetCollectionResultParameters;
+    })
+  | (BaseAnalysisResult & {
+      kind: "gsea";
+      parameters: GseaResultParameters;
+    });
 
 export interface JobResponse {
   job: JobRecord;
@@ -76,6 +127,7 @@ export interface GenePreview {
   unmatched_count: number;
   unmatched_examples: string[];
   id_type_counts: Record<string, number>;
+  source_counts?: Record<string, number>;
 }
 
 export interface CollectionPreview {

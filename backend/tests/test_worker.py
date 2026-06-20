@@ -169,6 +169,90 @@ def test_worker_constructs_engine_per_job(monkeypatch, tmp_path):
     assert len(store.written_results) == 2
 
 
+def test_worker_writes_mapping_report_artifact_and_strips_result_records(monkeypatch, tmp_path):
+    class FakeResult:
+        parameters: dict[str, object] = {}
+
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            return {
+                "kind": AnalysisKind.SET_SIMILARITY.value,
+                "results": [],
+                "parameters": {
+                    "id_mapping": {
+                        "genes": {
+                            "submitted_record_count": 2,
+                            "mapped_count": 1,
+                            "mapping_provenance": {"species": "hsa"},
+                            "records": [
+                                {
+                                    "submitted": "=ALPHA",
+                                    "mapped": "101",
+                                    "id_type": "symbol_like",
+                                    "source": "gene_mapping",
+                                    "candidates": [],
+                                },
+                                {
+                                    "submitted": "P40",
+                                    "mapped": None,
+                                    "id_type": "symbol_like",
+                                    "source": "ambiguous",
+                                    "candidates": ["101", "102"],
+                                },
+                            ],
+                        }
+                    }
+                },
+            }
+
+    class FakeEngine:
+        def __init__(self, settings: object):
+            self.settings = settings
+
+        def run_set_similarity(self, request: object, *, artifact_dir: Path) -> FakeResult:
+            return FakeResult()
+
+    class RunStore:
+        def __init__(self):
+            self.written_result: dict[str, object] | None = None
+
+        def read_input(self, job_id: str) -> dict[str, Any]:
+            return {"genes": ["101"]}
+
+        def run_dir(self, job_id: str) -> Path:
+            return tmp_path / job_id
+
+        def is_cancelled(self, job_id: str) -> bool:
+            return False
+
+        def write_result(self, job_id: str, result: dict[str, object]) -> None:
+            self.written_result = result
+
+        def mark_succeeded(self, job_id: str) -> bool:
+            return True
+
+        def mark_failed(self, job_id: str, error: str) -> bool:
+            raise AssertionError(error)
+
+    monkeypatch.setattr("andes_worker.main.AndesEngine", FakeEngine)
+
+    store = RunStore()
+    worker = Worker.__new__(Worker)
+    worker.settings = SimpleNamespace()
+    worker.store = store
+
+    assert worker._run_job(_job("mapping")) is True
+
+    report = tmp_path / "mapping" / "downloads" / "mapping-report.csv"
+    assert report.exists()
+    report_text = report.read_text(encoding="utf-8")
+    assert "genes,'=ALPHA,101,symbol_like,gene_mapping,mapped," in report_text
+    assert "genes,P40,,symbol_like,ambiguous,ambiguous,101|102" in report_text
+    assert store.written_result is not None
+    genes_mapping = store.written_result["parameters"]["id_mapping"]["genes"]  # type: ignore[index]
+    assert "records" not in genes_mapping
+    assert genes_mapping["mapping_report"] == "mapping-report.csv"
+
+
 def test_effective_parallelism_multiplies_jobs_by_workers():
     assert effective_parallelism(job_concurrency=4, workers_per_job=8) == 32
     assert effective_parallelism(job_concurrency=0, workers_per_job=0) == 1

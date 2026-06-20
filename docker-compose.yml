@@ -7,6 +7,8 @@ services:
     restart: unless-stopped
     environment: &andes_env
       ANDES_ORIGINAL_SRC: /andes-original/src
+      ANDES_ORIGINAL_ADAPTER_MODULE: "${ANDES_ORIGINAL_ADAPTER_MODULE:-}"
+      ANDES_ORIGINAL_REVISION: "${ANDES_ORIGINAL_REVISION:-}"
       ANDES_API_HOST: 0.0.0.0
       ANDES_EMBEDDING_PATH: /andes-original/data/embedding/node2vec_consensus.csv
       ANDES_GENE_LIST_PATH: /andes-original/data/embedding/consensus_node.txt

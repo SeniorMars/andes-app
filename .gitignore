@@ -1,4 +1,8 @@
 backend/.venv/
+.env
+backend/.env
+andes-original
+gene_mappings/
 backend/.pytest_cache/
 backend/.ruff_cache/
 backend/.mypy_cache/

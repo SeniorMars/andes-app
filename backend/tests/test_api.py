@@ -30,6 +30,9 @@ def _settings(tmp_path: Path) -> AndesSettings:
         runs_dir=tmp_path / "runs",
         sqlite_path=tmp_path / "runs" / "jobs.sqlite3",
         cache_dir=tmp_path / "cache",
+        gene_mapping_dir=None,
+        gene_mapping_path=None,
+        gene_mapping_sqlite_path=None,
     )
 
 
@@ -98,6 +101,83 @@ def test_data_status_reports_cache_without_requiring_it_for_readiness():
     assert "alias_path" not in payload["config"]
 
 
+def test_data_status_checks_configured_gene_mapping_path(tmp_path):
+    settings = _settings(tmp_path).model_copy(
+        update={"gene_mapping_path": tmp_path / "missing_hsa_mapping_all.txt"}
+    )
+    client = _loopback_client(create_app(settings))
+
+    response = client.get("/data/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["checks"]["gene_mapping_path"] is False
+    assert payload["config"]["gene_mapping_file_configured"] is True
+
+
+def test_data_status_resolves_gene_mapping_dir_from_species(tmp_path):
+    mapping_dir = tmp_path / "mappings"
+    mapping_dir.mkdir()
+    (mapping_dir / "mmu_mapping_all.txt").write_text(
+        "symbol\tentrez\tensembl\tuniprot_swiss\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path).model_copy(
+        update={"species": "mmu", "gene_mapping_dir": mapping_dir}
+    )
+    client = _loopback_client(create_app(settings))
+
+    response = client.get("/data/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["checks"]["gene_mapping_path"] is True
+    assert payload["config"]["species"] == "mmu"
+    assert payload["config"]["gene_mapping_file_configured"] is True
+
+
+def test_data_status_reports_mapping_index_error_after_startup_validation(tmp_path):
+    mapping_path = tmp_path / "hsa_mapping_all.txt"
+    mapping_path.write_text(
+        "symbol\tentrez\tensembl\tuniprot_swiss\n"
+        "ALPHA\t101\tENSG00000100001\tP00001\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "gene_mapping_path": mapping_path,
+            "gene_mapping_sqlite_path": tmp_path / "gene_mappings.sqlite3",
+            "gene_mapping_min_overlap": 0.5,
+        }
+    )
+
+    with _loopback_client(create_app(settings)) as client:
+        response = client.get("/data/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["checks"]["gene_mapping_path"] is True
+    assert payload["checks"]["gene_mapping_index"] is False
+    assert payload["gene_mapping"]["ready"] is False
+    assert "overlap only" in payload["gene_mapping"]["error"]
+
+
+def test_analysis_returns_503_when_mapping_service_unavailable(tmp_path):
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "gene_mapping_path": tmp_path / "missing_hsa_mapping_all.txt",
+            "gene_mapping_sqlite_path": tmp_path / "gene_mappings.sqlite3",
+        }
+    )
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post("/preview/set-similarity", data={"genes_text": "A\nB\n"})
+
+    assert response.status_code == 503
+    assert "gene mapping index unavailable" in response.json()["detail"]
+
+
 def test_local_loopback_dev_origin_is_allowed():
     client = TestClient(create_app())
     for origin in ("http://127.250.116.207:3000", "http://0.0.0.0:3000"):
@@ -128,6 +208,69 @@ def test_gsea_rejects_unknown_ranked_genes_before_queueing(tmp_path):
 
     assert response.status_code == 400
     assert "none of the ranked genes" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("path", ["/preview/gsea", "/jobs/gsea"])
+def test_gsea_rejects_duplicate_submitted_ranked_ids(tmp_path, path):
+    client = TestClient(create_app(_settings(tmp_path)))
+
+    response = client.post(path, data={"ranked_text": "A\t3\nB\t2\nA\t1"})
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["message"] == "ranked gene identifier collision"
+    assert detail["duplicate_submitted"] == [{"submitted": "A", "scores": [3.0, 1.0]}]
+
+
+@pytest.mark.parametrize("path", ["/preview/gsea", "/jobs/gsea"])
+def test_gsea_rejects_cross_namespace_ranked_collisions(tmp_path, path):
+    mapping_path = tmp_path / "hsa_mapping_all.txt"
+    mapping_path.write_text(
+        "symbol\tentrez\tensembl\tuniprot_swiss\n"
+        "ALPHA\tA\tENSG00000141510\tP04637\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "gene_mapping_path": mapping_path,
+            "gene_mapping_sqlite_path": tmp_path / "gene_mapping.sqlite3",
+        }
+    )
+    client = TestClient(create_app(settings))
+
+    response = client.post(
+        path,
+        data={"ranked_text": "ALPHA\t3\nENSG00000141510\t2\nP04637\t1\nB\t0"},
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["message"] == "ranked gene identifier collision"
+    assert detail["canonical_collisions"] == [
+        {
+            "canonical": "A",
+            "submissions": [
+                {
+                    "submitted": "ALPHA",
+                    "score": 3.0,
+                    "source": "gene_mapping",
+                    "id_type": "symbol_like",
+                },
+                {
+                    "submitted": "ENSG00000141510",
+                    "score": 2.0,
+                    "source": "gene_mapping",
+                    "id_type": "ensembl_gene",
+                },
+                {
+                    "submitted": "P04637",
+                    "score": 1.0,
+                    "source": "gene_mapping",
+                    "id_type": "uniprot_like",
+                },
+            ],
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -205,6 +348,7 @@ def test_set_similarity_preview_reports_counts_and_cache_status(tmp_path):
     assert payload["estimated_pair_count"] == 3
     assert payload["genes"]["matched_count"] == 2
     assert payload["genes"]["unmatched_count"] == 1
+    assert payload["genes"]["source_counts"]["unmapped"] == 1
     assert payload["target_collection"]["usable_term_count"] == 3
     assert payload["cache"]["status"] in {"build", "reuse", "extend_or_rebuild"}
     assert "path" not in payload["cache"]
@@ -216,6 +360,78 @@ def test_set_similarity_preview_reports_counts_and_cache_status(tmp_path):
     assert isinstance(token_payload["payload_hash"], str)
     assert isinstance(token_payload["expires_at"], str)
     datetime.fromisoformat(token_payload["expires_at"])
+
+
+def test_set_similarity_preview_uses_full_unresolved_mapping_count(tmp_path):
+    client = TestClient(create_app(_settings(tmp_path)))
+    missing = "\n".join(f"MISSING{i}" for i in range(12))
+
+    response = client.post(
+        "/preview/set-similarity",
+        data={
+            "genes_text": f"A\nB\n{missing}",
+            "min_gene_set_size": "1",
+            "max_gene_set_size": "3",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["genes"]["unmatched_count"] == 12
+    assert len(payload["genes"]["unmatched_examples"]) == 10
+
+
+def test_set_similarity_preview_separates_unmapped_and_ambiguous_counts(tmp_path):
+    mapping_path = tmp_path / "hsa_mapping_all.txt"
+    mapping_path.write_text(
+        "symbol\tentrez\tensembl\tuniprot_swiss\n"
+        "SHARED\tA\tENSG00000141510\tP04637\n"
+        "SHARED\tB\tENSG00000146648\tP00533\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "gene_mapping_path": mapping_path,
+            "gene_mapping_sqlite_path": tmp_path / "gene_mapping.sqlite3",
+        }
+    )
+    client = TestClient(create_app(settings))
+
+    response = client.post(
+        "/preview/set-similarity",
+        data={
+            "genes_text": "A\nSHARED\nMISSING",
+            "min_gene_set_size": "1",
+            "max_gene_set_size": "3",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["genes"]["unmatched_count"] == 2
+    assert payload["genes"]["source_counts"]["unmapped"] == 1
+    assert payload["genes"]["source_counts"]["ambiguous"] == 1
+
+
+def test_set_similarity_preview_offloads_mapper_and_preview_work(tmp_path, monkeypatch):
+    calls: list[str] = []
+
+    async def inline_threadpool(func, *args, **kwargs):
+        calls.append(getattr(func, "__name__", repr(func)))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "run_in_threadpool", inline_threadpool)
+    app = create_app(_settings(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/preview/set-similarity",
+            data={"genes_text": "A\nB", "min_gene_set_size": "1", "max_gene_set_size": "3"},
+        )
+
+    assert response.status_code == 200
+    assert "_make_mapper" in calls
+    assert "_preview_set_similarity_with_temp_paths" in calls
 
 
 def test_matching_preview_digest_skips_submission_preview(tmp_path):
@@ -561,7 +777,7 @@ def test_api_created_jobs_require_access_token_for_public_reads(tmp_path):
         },
     )
     downloads = app.state.store.run_dir(job_id) / "downloads"
-    downloads.mkdir(parents=True)
+    downloads.mkdir(parents=True, exist_ok=True)
     (downloads / "results.csv").write_text("term,z_score\nTERM_A,1.0\n", encoding="utf-8")
 
     blocked_job = client.get(f"/jobs/{job_id}")
@@ -860,6 +1076,65 @@ def test_alias_mapping_is_applied_before_queueing(tmp_path):
     assert payload["id_mapping"]["genes"]["mapped_count"] == 2
 
 
+def test_gene_mapping_file_maps_inputs_to_entrez_before_queueing(tmp_path):
+    gene_list_path = tmp_path / "entrez_genes.txt"
+    embedding_path = tmp_path / "embedding.csv"
+    gene_set_path = tmp_path / "sets.gmt"
+    mapping_path = tmp_path / "hsa_mapping_all.txt"
+    mapping_dir = tmp_path / "mappings"
+    mapping_dir.mkdir()
+    gene_list_path.write_text("101\n102\n", encoding="utf-8")
+    embedding_path.write_text("1,0\n0,1\n", encoding="utf-8")
+    gene_set_path.write_text("TERM_X\tcustom\t101\t102\n", encoding="utf-8")
+    mapping_path.write_text(
+        "symbol\tentrez\tensembl\tuniprot_swiss\texternal_synonym\n"
+        "ALPHA\t101\tENSG00000100001\tP00001\tA1\n"
+        "BETA\t102\tENSG00000100002\tP00002\tB1\n",
+        encoding="utf-8",
+    )
+    mapping_path.rename(mapping_dir / "hsa_mapping_all.txt")
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "gene_list_path": gene_list_path,
+            "embedding_path": embedding_path,
+            "default_gene_set_path": gene_set_path,
+            "species": "hsa",
+            "gene_mapping_dir": mapping_dir,
+            "gene_mapping_sqlite_path": tmp_path / "gene_mappings.sqlite3",
+        }
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+
+    response = client.post(
+        "/jobs/set-similarity",
+        data={
+            "genes_text": "ALPHA\nENSG00000100002",
+            "min_gene_set_size": "1",
+            "max_gene_set_size": "3",
+        },
+    )
+
+    assert response.status_code == 202
+    job_id = response.json()["id"]
+    payload = app.state.store.read_input(job_id)
+    assert payload["genes"] == ["101", "102"]
+    genes_mapping = payload["id_mapping"]["genes"]
+    assert genes_mapping["mapped_count"] == 2
+    assert "records" not in genes_mapping
+    assert genes_mapping["mapping_report"] == "mapping-report.csv"
+    assert genes_mapping["source_counts"]["gene_mapping"] == 2
+    provenance = genes_mapping["mapping_provenance"]
+    assert provenance["species"] == "hsa"
+    assert provenance["mapping_file"] == "hsa_mapping_all.txt"
+    assert isinstance(provenance["mapping_sha256"], str)
+    report = app.state.store.run_dir(job_id) / "downloads" / "mapping-report.csv"
+    assert report.exists()
+    report_text = report.read_text(encoding="utf-8")
+    assert "genes,ALPHA,101,symbol_like,gene_mapping,mapped," in report_text
+    assert "genes,ENSG00000100002,102,ensembl_gene,gene_mapping,mapped," in report_text
+
+
 def test_set_similarity_accepts_valid_uploaded_gmt(tmp_path):
     app = create_app(_settings(tmp_path))
     client = TestClient(app)
@@ -871,10 +1146,18 @@ def test_set_similarity_accepts_valid_uploaded_gmt(tmp_path):
     )
 
     assert response.status_code == 202
-    payload = app.state.store.read_input(response.json()["id"])
+    job_id = response.json()["id"]
+    payload = app.state.store.read_input(job_id)
     gene_set_path = Path(payload["gene_set_path"])
     assert gene_set_path.name == "target_gene_sets.gmt"
     assert gene_set_path.read_text(encoding="utf-8") == "TERM_X\tcustom\tA\tB\n"
+    target_mapping = payload["id_mapping"]["target_collection"]
+    assert "records" not in target_mapping
+    assert target_mapping["mapping_report"] == "mapping-report.csv"
+    report = app.state.store.run_dir(job_id) / "downloads" / "mapping-report.csv"
+    assert "target_collection,A,A,symbol_like,embedding,mapped," in report.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_set_similarity_accepts_query_collection_upload(tmp_path):
@@ -1194,6 +1477,18 @@ def test_mapping_report_and_report_zip_are_generated_from_results(tmp_path):
                 "cache": {"path": private_cache_path, "file": "private.pkl"},
                 "id_mapping": {
                     "genes": {
+                        "mapping_provenance": {
+                            "species": "hsa",
+                            "mapping_file": "hsa_mapping_all.txt",
+                            "mapping_mtime_ns": 123,
+                            "mapping_size": 456,
+                            "mapping_sha256": "abc123",
+                            "gene_list_file": "consensus_node.txt",
+                            "gene_list_mtime_ns": 789,
+                            "gene_list_size": 111,
+                            "sqlite_file": "gene_mappings_hsa.sqlite3",
+                            "alias_rows": 3,
+                        },
                         "records": [
                             {
                                 "submitted": "ALPHA",
@@ -1206,6 +1501,13 @@ def test_mapping_report_and_report_zip_are_generated_from_results(tmp_path):
                                 "mapped": None,
                                 "id_type": "unknown",
                                 "source": "unmapped",
+                            },
+                            {
+                                "submitted": "AMB",
+                                "mapped": None,
+                                "id_type": "symbol_like",
+                                "source": "ambiguous",
+                                "candidates": ["101", "102"],
                             },
                         ]
                     }
@@ -1225,21 +1527,38 @@ def test_mapping_report_and_report_zip_are_generated_from_results(tmp_path):
         headers=headers,
     )
     zip_response = client.get(f"/jobs/{job.id}/download/report.zip", headers=headers)
+    provenance_response = client.get(
+        f"/jobs/{job.id}/download/mapping-provenance.json",
+        headers=headers,
+    )
 
     assert mapping_response.status_code == 200
-    assert "collection,submitted_id,mapped_id,detected_type,source,status" in mapping_response.text
-    assert "genes,ALPHA,A,alias,alias_file,mapped" in mapping_response.text
-    assert "genes,UNKNOWN,,unknown,unmapped,unmapped" in mapping_response.text
+    assert (
+        "collection,submitted_id,mapped_id,detected_type,source,status,candidates"
+        in mapping_response.text
+    )
+    assert "genes,ALPHA,A,alias,alias_file,mapped," in mapping_response.text
+    assert "genes,UNKNOWN,,unknown,unmapped,unmapped," in mapping_response.text
+    assert "genes,AMB,,symbol_like,ambiguous,ambiguous,101|102" in mapping_response.text
+    assert provenance_response.status_code == 200
+    provenance_payload = provenance_response.json()
+    assert provenance_payload["mapping_provenance"]["mapping_file"] == "hsa_mapping_all.txt"
+    assert provenance_payload["mapping_provenance"]["mapping_sha256"] == "abc123"
+    assert provenance_payload["collections"]["genes"]["alias_rows"] == 3
     assert zip_response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(zip_response.content)) as archive:
         names = set(archive.namelist())
         assert "results.json" in names
         assert "results.csv" in names
         assert "mapping-report.csv" in names
+        assert "mapping-provenance.json" in names
         assert "parameters.json" in names
         assert "cache.json" in names
         assert "figures/z-scores.svg" in names
         assert "unsafe.txt" not in names
+        zip_provenance = json.loads(archive.read("mapping-provenance.json").decode("utf-8"))
+        assert zip_provenance["mapping_provenance"]["mapping_file"] == "hsa_mapping_all.txt"
+        assert zip_provenance["collections"]["genes"]["mapping_sha256"] == "abc123"
         results_json = archive.read("results.json").decode("utf-8")
         assert "sets.gmt" in results_json
         for name in names:
@@ -1248,6 +1567,159 @@ def test_mapping_report_and_report_zip_are_generated_from_results(tmp_path):
             text = archive.read(name).decode("utf-8")
             assert private_runs_path not in text
             assert private_cache_path not in text
+
+
+def test_mapping_report_download_uses_artifact_when_result_records_are_stripped(tmp_path):
+    settings = _settings(tmp_path).model_copy(update={"token_hash_secret": "download-secret"})
+    app = create_app(settings)
+    client = TestClient(app)
+    store = app.state.store
+    job = store.create_job(
+        AnalysisKind.SET_SIMILARITY,
+        {"genes": ["101"]},
+        access_token="job-secret",
+    )
+    store.write_result(
+        job.id,
+        {
+            "kind": AnalysisKind.SET_SIMILARITY.value,
+            "results": [],
+            "input_gene_count": 1,
+            "valid_gene_count": 1,
+            "invalid_genes": [],
+            "warnings": [],
+            "parameters": {
+                "id_mapping": {
+                    "genes": {
+                        "submitted_record_count": 1,
+                        "mapped_count": 1,
+                        "mapping_report": "mapping-report.csv",
+                        "mapping_provenance": {"species": "hsa"},
+                    }
+                }
+            },
+        },
+    )
+    downloads = store.run_dir(job.id) / "downloads"
+    downloads.mkdir(parents=True)
+    (downloads / "mapping-report.csv").write_text(
+        "collection,submitted_id,mapped_id,detected_type,source,status,candidates\n"
+        "genes,ALPHA,101,symbol_like,gene_mapping,mapped,\n",
+        encoding="utf-8",
+    )
+    store.mark_succeeded(job.id)
+
+    response = client.get(
+        f"/jobs/{job.id}/download/mapping-report.csv",
+        headers={"x-andes-job-token": "job-secret"},
+    )
+    zip_response = client.get(
+        f"/jobs/{job.id}/download/report.zip",
+        headers={"x-andes-job-token": "job-secret"},
+    )
+
+    assert response.status_code == 200
+    assert "genes,ALPHA,101,symbol_like,gene_mapping,mapped," in response.text
+    assert zip_response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(zip_response.content)) as archive:
+        assert "mapping-report.csv" in archive.namelist()
+        assert "genes,ALPHA,101" in archive.read("mapping-report.csv").decode("utf-8")
+        results_json = json.loads(archive.read("results.json").decode("utf-8"))
+        assert "records" not in results_json["parameters"]["id_mapping"]["genes"]
+
+
+def test_report_zip_includes_gsea_running_score_svg(tmp_path):
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app)
+    store = app.state.store
+    job = store.create_job(
+        AnalysisKind.GSEA,
+        {"ranked_genes": [["A", 2.0], ["B", 1.0]]},
+        access_token="job-secret",
+    )
+    store.write_result(
+        job.id,
+        {
+            "kind": "gsea",
+            "results": [
+                {
+                    "term": "TERM_A",
+                    "description": "alpha",
+                    "size": 2,
+                    "true_score": 0.5,
+                    "z_score": 2.0,
+                    "p_value": 0.01,
+                    "p_value_corrected": 0.02,
+                    "log10_p_value_corrected": 1.7,
+                    "significant": True,
+                }
+            ],
+            "input_gene_count": 2,
+            "valid_gene_count": 2,
+            "invalid_genes": [],
+            "warnings": [],
+            "parameters": {
+                "mode": "ranked_enrichment",
+                "gsea_trace": {
+                    "ranked_gene_count": 2,
+                    "terms": [
+                        {
+                            "term": "TERM_A",
+                            "description": "alpha",
+                            "size": 2,
+                            "true_score": 0.5,
+                            "z_score": 2.0,
+                            "p_value_corrected": 0.02,
+                            "es": 0.5,
+                            "es_rank": 2,
+                            "points": [
+                                {
+                                    "rank": "bad",
+                                    "gene": "BAD",
+                                    "rank_score": 0.0,
+                                    "best_match_gene": "BAD",
+                                    "match_score": "bad",
+                                    "centered_score": 0.0,
+                                    "running_es": "bad",
+                                },
+                                {
+                                    "rank": 1,
+                                    "gene": "A",
+                                    "rank_score": 2.0,
+                                    "best_match_gene": "A",
+                                    "match_score": 0.2,
+                                    "centered_score": -0.1,
+                                    "running_es": -0.1,
+                                },
+                                {
+                                    "rank": 2,
+                                    "gene": "B",
+                                    "rank_score": 1.0,
+                                    "best_match_gene": "B",
+                                    "match_score": 0.4,
+                                    "centered_score": 0.1,
+                                    "running_es": 0.0,
+                                },
+                            ],
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    store.mark_succeeded(job.id)
+
+    response = client.get(
+        f"/jobs/{job.id}/download/report.zip",
+        headers={"x-andes-job-token": "job-secret"},
+    )
+
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert "figures/gsea-running-score.svg" in set(archive.namelist())
+        svg = archive.read("figures/gsea-running-score.svg").decode("utf-8")
+        assert "GSEA running score" in svg
+        assert "alpha" in svg
 
 
 def test_rerun_clones_uploaded_gene_set_into_new_job(tmp_path):
@@ -1278,6 +1750,10 @@ def test_rerun_clones_uploaded_gene_set_into_new_job(tmp_path):
     assert Path(rerun_input["gene_set_path"]).read_text(encoding="utf-8") == (
         "TERM_X\tcustom\tA\tB\n"
     )
+    source_report = app.state.store.run_dir(source_id) / "downloads" / "mapping-report.csv"
+    rerun_report = app.state.store.run_dir(rerun_payload["id"]) / "downloads" / "mapping-report.csv"
+    assert source_report.exists()
+    assert rerun_report.read_text(encoding="utf-8") == source_report.read_text(encoding="utf-8")
     assert Path(rerun_input["gene_set_path"]).is_relative_to(
         app.state.store.run_dir(rerun_payload["id"])
     )

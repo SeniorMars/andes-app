@@ -15,6 +15,8 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Iterable
+from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,12 +24,15 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from andes_core.config import AndesSettings, get_settings
 from andes_core.engine import AndesEngine
+from andes_core.gene_mapping import GeneMappingService, GeneMappingUnavailable
 from andes_core.io import (
     GeneIdMapper,
     GeneIdMapping,
+    GeneIdMapRecord,
     go_obo_annotations_to_gmt_text,
     normalize_gmt_text,
     parse_gene_lines,
@@ -85,6 +90,8 @@ def _public_path_key(key: str) -> str:
 
 
 def _private_roots(settings: AndesSettings) -> tuple[str, ...]:
+    gene_mapping_path = settings.resolved_gene_mapping_path()
+    gene_mapping_sqlite_path = settings.resolved_gene_mapping_sqlite_path()
     roots = [
         settings.runs_dir,
         settings.cache_dir,
@@ -95,6 +102,10 @@ def _private_roots(settings: AndesSettings) -> tuple[str, ...]:
     ]
     if settings.alias_path is not None:
         roots.append(settings.alias_path.parent)
+    if gene_mapping_path is not None:
+        roots.append(gene_mapping_path.parent)
+    if gene_mapping_sqlite_path is not None:
+        roots.append(gene_mapping_sqlite_path.parent)
     resolved: list[str] = []
     for root in roots:
         root_text = str(root.expanduser().resolve()).rstrip("/")
@@ -166,6 +177,12 @@ def _preview_settings_fingerprint(settings: AndesSettings) -> dict[str, object]:
         "gene_list_path": _path_fingerprint(settings.gene_list_path),
         "default_gene_set_path": _path_fingerprint(settings.default_gene_set_path),
         "alias_path": _path_fingerprint(settings.alias_path),
+        "original_src": _path_fingerprint(settings.original_src),
+        "original_adapter_module": settings.normalized_original_adapter_module(),
+        "original_revision": settings.normalized_original_revision(),
+        "species": settings.normalized_species(),
+        "canonical_id_namespace": settings.normalized_canonical_id_namespace(),
+        "gene_mapping_path": _path_fingerprint(settings.resolved_gene_mapping_path()),
         "max_term_pairs": settings.max_term_pairs,
         "max_terms_per_collection": settings.max_terms_per_collection,
         "allow_large_jobs": settings.allow_large_jobs,
@@ -324,6 +341,11 @@ def _config_status(settings: AndesSettings) -> dict[str, object]:
         "token_hash_secret_configured": bool(settings.token_hash_secret),
         "trusted_user_header": settings.trusted_user_header,
         "alias_file_configured": bool(settings.alias_path),
+        "species": settings.normalized_species(),
+        "canonical_id_namespace": settings.normalized_canonical_id_namespace(),
+        "gene_mapping_min_overlap": settings.gene_mapping_min_overlap,
+        "gene_mapping_dir_configured": bool(settings.gene_mapping_dir),
+        "gene_mapping_file_configured": bool(settings.resolved_gene_mapping_path()),
     }
 
 
@@ -332,6 +354,13 @@ def _write_csv(path: Path, rows: list[list[object]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerows(_csv_safe_row(row) for row in rows)
+
+
+def _csv_text(rows: Iterable[list[object]]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerows(_csv_safe_row(row) for row in rows)
+    return output.getvalue()
 
 
 def _write_zip_csv(
@@ -469,7 +498,15 @@ def _matrix_cell_count(pair_rows: list[dict[str, Any]]) -> int:
 
 def _mapping_report_rows(result: dict[str, Any]) -> list[list[object]]:
     rows: list[list[object]] = [
-        ["collection", "submitted_id", "mapped_id", "detected_type", "source", "status"]
+        [
+            "collection",
+            "submitted_id",
+            "mapped_id",
+            "detected_type",
+            "source",
+            "status",
+            "candidates",
+        ]
     ]
     parameters = result.get("parameters")
     if not isinstance(parameters, dict):
@@ -487,17 +524,45 @@ def _mapping_report_rows(result: dict[str, Any]) -> list[list[object]]:
             if not isinstance(record, dict):
                 continue
             mapped = record.get("mapped")
+            source = record.get("source", "")
+            candidates = record.get("candidates", [])
+            if not isinstance(candidates, list | tuple):
+                candidates = []
             rows.append(
                 [
                     collection,
                     record.get("submitted", ""),
                     mapped or "",
                     record.get("id_type", ""),
-                    record.get("source", ""),
-                    "mapped" if mapped else "unmapped",
+                    source,
+                    "mapped" if mapped else source if source == "ambiguous" else "unmapped",
+                    "|".join(str(candidate) for candidate in candidates),
                 ]
             )
     return rows
+
+
+def _mapping_provenance_payload(result: dict[str, Any]) -> dict[str, object] | None:
+    parameters = result.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    id_mapping = parameters.get("id_mapping")
+    if not isinstance(id_mapping, dict):
+        return None
+    by_collection: dict[str, object] = {}
+    for collection, payload in sorted(id_mapping.items()):
+        if not isinstance(payload, dict):
+            continue
+        provenance = payload.get("mapping_provenance")
+        if isinstance(provenance, dict):
+            by_collection[collection] = provenance
+    if not by_collection:
+        return None
+    unique = list(by_collection.values())
+    return {
+        "mapping_provenance": unique[0] if all(item == unique[0] for item in unique) else None,
+        "collections": by_collection,
+    }
 
 
 def _materialize_download_from_result(
@@ -512,11 +577,20 @@ def _materialize_download_from_result(
     public_result = _public_result_payload(result, settings)
     downloads = store.run_dir(job_id) / "downloads"
     path = downloads / filename
+    if filename == "mapping-report.csv" and path.exists():
+        return path
     if filename == "mapping-report.csv":
         mapping_rows = _mapping_report_rows(public_result)
         if len(mapping_rows) <= 1:
             return None
         _write_csv(path, mapping_rows)
+        return path
+    if filename == "mapping-provenance.json":
+        provenance = _mapping_provenance_payload(public_result)
+        if provenance is None:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
         return path
 
     result_rows = _job_result_rows(public_result)
@@ -544,6 +618,17 @@ def _materialize_download_from_result(
 def _float_value(row: dict[str, Any], key: str) -> float:
     value = row.get(key)
     return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _svg_label(value: object) -> str:
@@ -660,6 +745,116 @@ def _pair_heatmap_svg(rows: list[dict[str, Any]]) -> str | None:
     )
 
 
+def _gsea_trace_svg(result: dict[str, Any]) -> str | None:
+    parameters = result.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    trace = parameters.get("gsea_trace")
+    if not isinstance(trace, dict):
+        return None
+    terms = trace.get("terms")
+    if not isinstance(terms, list) or not terms:
+        return None
+    term = terms[0]
+    if not isinstance(term, dict):
+        return None
+    points = term.get("points")
+    if not isinstance(points, list) or len(points) < 2:
+        return None
+    point_dicts = [point for point in points if isinstance(point, dict)]
+    if len(point_dicts) < 2:
+        return None
+
+    parsed_points = []
+    for point in point_dicts:
+        rank = _optional_float(point.get("rank"))
+        running_es = _optional_float(point.get("running_es"))
+        match_score = _optional_float(point.get("match_score"))
+        if rank is None or running_es is None or match_score is None:
+            continue
+        parsed_points.append((point, int(rank), running_es, match_score))
+    if len(parsed_points) < 2:
+        return None
+
+    width = 900
+    height = 380
+    left = 58
+    right = 28
+    top = 58
+    es_bottom = 250
+    score_top = 280
+    bottom = 340
+    ranks = [rank for _point, rank, _running, _score in parsed_points]
+    running = [value for _point, _rank, value, _score in parsed_points]
+    match_scores = [score for _point, _rank, _running, score in parsed_points]
+    min_rank = min(ranks)
+    max_rank = max(ranks)
+    min_es = min([*running, 0.0])
+    max_es = max([*running, 0.0])
+    min_match = min(match_scores)
+    max_match = max(match_scores)
+
+    def x_for(rank: int) -> float:
+        if max_rank == min_rank:
+            return left
+        return left + ((rank - min_rank) / (max_rank - min_rank)) * (width - left - right)
+
+    def es_y(value: float) -> float:
+        if max_es == min_es:
+            return (top + es_bottom) / 2
+        return es_bottom - ((value - min_es) / (max_es - min_es)) * (es_bottom - top)
+
+    def bar_y(value: float) -> float:
+        if max_match == min_match:
+            return (score_top + bottom) / 2
+        return bottom - ((value - min_match) / (max_match - min_match)) * (bottom - score_top)
+
+    path_points = " ".join(
+        f"{x_for(rank):.2f},{es_y(value):.2f}" for rank, value in zip(ranks, running, strict=True)
+    )
+    zero_y = es_y(0.0)
+    bars = []
+    for point, rank, _running, score in parsed_points:
+        x = x_for(rank)
+        y = bar_y(score)
+        gene = point.get("gene", "")
+        best_gene = point.get("best_match_gene", "")
+        bars.append(
+            f"<line x1=\"{x:.2f}\" x2=\"{x:.2f}\" y1=\"{bottom}\" y2=\"{y:.2f}\" "
+            "stroke=\"#006f65\" stroke-opacity=\"0.46\" stroke-width=\"1.3\">"
+            f"<title>rank {rank}; {_svg_label(gene)} best matches {_svg_label(best_gene)}; "
+            f"score={score:.3f}</title></line>"
+        )
+
+    title = term.get("description") or term.get("term") or "GSEA term"
+    z_score = term.get("z_score", "")
+    fdr = term.get("p_value_corrected", "")
+    es_rank = term.get("es_rank", "")
+    return (
+        f"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {height}\" "
+        "role=\"img\" aria-label=\"GSEA running score plot\">"
+        "<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>"
+        f"<text x=\"{left}\" y=\"28\" fill=\"#111917\" font-family=\"Arial\" "
+        "font-size=\"18\" font-weight=\"700\">GSEA running score</text>"
+        f"<text x=\"{left}\" y=\"48\" fill=\"#5a6865\" font-family=\"Arial\" font-size=\"12\">"
+        f"{_svg_label(title)}; z={_svg_label(z_score)}; FDR={_svg_label(fdr)}</text>"
+        f"<line x1=\"{left}\" x2=\"{width - right}\" y1=\"{zero_y:.2f}\" y2=\"{zero_y:.2f}\" "
+        "stroke=\"#cedbd8\"/>"
+        f"<line x1=\"{left}\" x2=\"{left}\" y1=\"{top}\" y2=\"{bottom}\" stroke=\"#aebfba\"/>"
+        f"<line x1=\"{left}\" x2=\"{width - right}\" y1=\"{es_bottom}\" y2=\"{es_bottom}\" "
+        "stroke=\"#aebfba\"/>"
+        f"<line x1=\"{left}\" x2=\"{width - right}\" y1=\"{bottom}\" y2=\"{bottom}\" "
+        "stroke=\"#aebfba\"/>"
+        f"{''.join(bars)}"
+        f"<polyline points=\"{path_points}\" fill=\"none\" stroke=\"#3549a6\" "
+        "stroke-width=\"2.6\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>"
+        f"<text x=\"{left}\" y=\"{height - 14}\" fill=\"#5a6865\" font-family=\"Arial\" "
+        f"font-size=\"12\">{len(point_dicts)} sampled ranks; ES peak rank "
+        f"{_svg_label(es_rank)}</text>"
+        "</svg>"
+    )
+
+
 def _write_report_zip(
     path: Path,
     job_id: str,
@@ -670,6 +865,8 @@ def _write_report_zip(
     rows = _job_result_rows(public_result)
     pair_rows = [row for row in rows if row.get("query_term") and row.get("target_term")]
     mapping_rows = _mapping_report_rows(public_result)
+    existing_mapping_report = path.parent / "mapping-report.csv"
+    mapping_provenance = _mapping_provenance_payload(public_result)
     parameters = public_result.get("parameters", {})
     cache = parameters.get("cache", {}) if isinstance(parameters, dict) else {}
     warnings = public_result.get("warnings", [])
@@ -696,6 +893,13 @@ def _write_report_zip(
                     )
             if len(mapping_rows) > 1:
                 _write_zip_csv(archive, "mapping-report.csv", mapping_rows)
+            elif existing_mapping_report.exists():
+                archive.write(existing_mapping_report, "mapping-report.csv")
+            if mapping_provenance is not None:
+                archive.writestr(
+                    "mapping-provenance.json",
+                    json.dumps(mapping_provenance, indent=2),
+                )
             archive.writestr("parameters.json", json.dumps(parameters, indent=2))
             archive.writestr("cache.json", json.dumps(cache, indent=2))
             archive.writestr(
@@ -709,6 +913,9 @@ def _write_report_zip(
             heatmap_svg = _pair_heatmap_svg(rows)
             if heatmap_svg:
                 archive.writestr("figures/pair-heatmap.svg", heatmap_svg)
+            gsea_svg = _gsea_trace_svg(public_result)
+            if gsea_svg:
+                archive.writestr("figures/gsea-running-score.svg", gsea_svg)
             archive.writestr(
                 "README.txt",
                 "\n".join(
@@ -718,10 +925,12 @@ def _write_report_zip(
                         "results.json contains the sanitized public result payload.",
                         "results.csv contains the result rows used by the web table.",
                         "mapping-report.csv lists submitted IDs, mapped IDs, detected type, "
-                        "source, and status when mapping metadata is available.",
+                        "source, status, and candidates when mapping metadata is available.",
+                        "mapping-provenance.json records the mapping file basename, mtime, "
+                        "size, checksum, and species when available.",
                         "parameters.json and cache.json contain sanitized run metadata.",
                         "figures/*.svg contains server-generated SVG summaries when enough "
-                        "result rows are available.",
+                        "result rows or GSEA trace data are available.",
                         "",
                     ]
                 ),
@@ -763,6 +972,17 @@ def _clone_uploaded_path_fields(
         relative_path = relative.as_posix()
         files[relative_path] = resolved.read_text(encoding="utf-8")
         path_fields[field] = relative_path
+    if _payload_references_mapping_report(payload):
+        mapping_report_path = source_run_dir / "downloads" / "mapping-report.csv"
+        try:
+            files["downloads/mapping-report.csv"] = mapping_report_path.read_text(
+                encoding="utf-8"
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="source mapping report is no longer available",
+            ) from exc
     return files, path_fields
 
 
@@ -787,6 +1007,28 @@ def _preview_existing_request(
     if not isinstance(request, GseaRequest):
         raise ValueError("stored GSEA input is invalid")
     return engine.preview_gsea(request)
+
+
+def _preview_set_similarity_with_temp_paths(
+    engine: AndesEngine,
+    request: SetSimilarityRequest,
+    files: dict[str, str],
+    path_fields: dict[str, str],
+) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
+        return engine.preview_set_similarity(preview_request)
+
+
+def _preview_gsea_with_temp_paths(
+    engine: AndesEngine,
+    request: GseaRequest,
+    files: dict[str, str],
+    path_fields: dict[str, str],
+) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
+        return engine.preview_gsea(preview_request)
 
 
 async def _read_upload_text(upload: UploadFile, *, label: str, max_bytes: int) -> str:
@@ -846,22 +1088,125 @@ def _mapping_payload(
     mapping: GeneIdMapping,
     *,
     record_limit: int | None = 200,
+    include_records: bool = True,
 ) -> dict[str, object]:
     records = mapping.records if record_limit is None else mapping.records[:record_limit]
-    return {
+    source_counts = mapping.source_counts
+    resolved_records = [record for record in mapping.records if record.mapped is not None]
+    unique_canonical_ids = {record.mapped for record in resolved_records}
+    unmapped_records = [record for record in mapping.records if record.source == "unmapped"]
+    ambiguous_records = [record for record in mapping.records if record.source == "ambiguous"]
+    payload: dict[str, object] = {
         "mapped_count": len(mapping.mapped),
-        "unmapped_count": len(mapping.unmapped),
-        "unmapped_examples": mapping.unmapped[:10],
+        "submitted_record_count": len(mapping.records),
+        "resolved_record_count": len(resolved_records),
+        "unique_canonical_count": len(unique_canonical_ids),
+        "unresolved_count": len(unmapped_records) + len(ambiguous_records),
+        "unmapped_count": len(unmapped_records),
+        "unmapped_examples": [record.submitted for record in unmapped_records][:10],
+        "ambiguous_count": len(ambiguous_records),
+        "ambiguous_examples": [record.submitted for record in ambiguous_records][:10],
         "id_type_counts": mapping.id_type_counts,
-        "records": [record.__dict__ for record in records],
+        "source_counts": source_counts,
+        "mapping_provenance": mapping.provenance,
     }
+    if include_records:
+        payload["records"] = [asdict(record) for record in records]
+    elif mapping.records:
+        payload["mapping_report"] = "mapping-report.csv"
+    return payload
 
 
-def _make_mapper(settings: AndesSettings) -> GeneIdMapper:
+def _mapping_report_artifact_files(id_mapping_with_records: dict[str, object]) -> dict[str, str]:
+    rows = _mapping_report_rows({"parameters": {"id_mapping": id_mapping_with_records}})
+    if len(rows) <= 1:
+        return {}
+    return {"downloads/mapping-report.csv": _csv_text(rows)}
+
+
+def _payload_references_mapping_report(payload: dict[str, Any]) -> bool:
+    id_mapping = payload.get("id_mapping")
+    if not isinstance(id_mapping, dict):
+        return False
+    return any(
+        isinstance(mapping_payload, dict)
+        and mapping_payload.get("mapping_report") == "mapping-report.csv"
+        for mapping_payload in id_mapping.values()
+    )
+
+
+def _map_ranked_rows_or_raise(
+    mapper: GeneIdMapper,
+    ranked_rows: list[tuple[str, float]],
+) -> tuple[list[tuple[str, float]], GeneIdMapping]:
+    records: list[GeneIdMapRecord] = []
+    unmapped: list[str] = []
+    submitted_scores: dict[str, list[float]] = {}
+    canonical_groups: dict[str, list[dict[str, object]]] = {}
+
+    records = mapper.map_records([submitted for submitted, _score in ranked_rows])
+    for (_submitted, score), record in zip(ranked_rows, records, strict=True):
+        submitted_scores.setdefault(record.submitted, []).append(float(score))
+        if record.mapped is None:
+            unmapped.append(record.submitted)
+            continue
+        canonical_groups.setdefault(record.mapped, []).append(
+            {
+                "submitted": record.submitted,
+                "score": float(score),
+                "source": record.source,
+                "id_type": record.id_type,
+            }
+        )
+
+    duplicate_submitted = [
+        {"submitted": submitted, "scores": scores}
+        for submitted, scores in submitted_scores.items()
+        if len(scores) > 1
+    ]
+    canonical_collisions = [
+        {"canonical": canonical, "submissions": submissions}
+        for canonical, submissions in canonical_groups.items()
+        if len(submissions) > 1
+    ]
+    if duplicate_submitted or canonical_collisions:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "ranked gene identifier collision",
+                "duplicate_submitted": duplicate_submitted[:20],
+                "canonical_collisions": canonical_collisions[:20],
+                "policy": "submit one score per canonical Entrez gene",
+            },
+        )
+
+    mapped: list[str] = []
+    ranked_genes: list[tuple[str, float]] = []
+    for (_submitted, score), record in zip(ranked_rows, records, strict=True):
+        if record.mapped is None:
+            continue
+        mapped.append(record.mapped)
+        ranked_genes.append((record.mapped, score))
+
+    return (
+        ranked_genes,
+        GeneIdMapping(
+            mapped=mapped,
+            unmapped=unmapped,
+            records=records,
+            provenance=mapper.mapping_provenance,
+        ),
+    )
+
+
+def _make_mapper(gene_mapping_service: GeneMappingService) -> GeneIdMapper:
     try:
-        return GeneIdMapper.from_paths(settings.gene_list_path, settings.alias_path)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return gene_mapping_service.get_mapper()
+    except GeneMappingUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"gene mapping index unavailable: {exc}",
+        ) from exc
 
 
 async def _normalize_gene_set_upload(
@@ -885,10 +1230,11 @@ async def _normalize_gene_set_upload(
     if gmt_file is not None:
         text = await _read_upload_text(gmt_file, label=f"{label} GMT", max_bytes=max_upload_bytes)
         try:
-            text, mapping = normalize_gmt_text(text, mapper)
+            text, mapping = await run_in_threadpool(normalize_gmt_text, text, mapper)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"{label}: {exc}") from exc
-        _validate_uploaded_gmt(
+        await run_in_threadpool(
+            _validate_uploaded_gmt,
             text,
             known_genes=mapper.known_genes,
             min_gene_set_size=min_gene_set_size,
@@ -911,14 +1257,16 @@ async def _normalize_gene_set_upload(
             max_bytes=max_upload_bytes,
         )
         try:
-            text, mapping = go_obo_annotations_to_gmt_text(
+            text, mapping = await run_in_threadpool(
+                go_obo_annotations_to_gmt_text,
                 obo_text=obo_text,
                 annotation_text=annotation_text,
                 known_genes=mapper.known_genes,
                 mapper=mapper,
                 namespace=go_namespace,
             )
-            validate_gmt_text(
+            await run_in_threadpool(
+                validate_gmt_text,
                 text,
                 known_genes=mapper.known_genes,
                 min_gene_set_size=min_gene_set_size,
@@ -934,6 +1282,7 @@ async def _normalize_gene_set_upload(
 async def _prepare_set_similarity(
     *,
     settings: AndesSettings,
+    gene_mapping_service: GeneMappingService,
     genes_file: UploadFile | None,
     query_gene_set_file: UploadFile | None,
     query_obo_file: UploadFile | None,
@@ -945,11 +1294,13 @@ async def _prepare_set_similarity(
     min_gene_set_size: int,
     max_gene_set_size: int,
     go_namespace: str,
-) -> tuple[SetSimilarityRequest, dict[str, str], dict[str, str]]:
-    mapper = _make_mapper(settings)
+    include_mapping_artifact: bool = False,
+) -> tuple[SetSimilarityRequest, dict[str, str], dict[str, str], dict[str, str]]:
+    mapper = await run_in_threadpool(_make_mapper, gene_mapping_service)
     files: dict[str, str] = {}
     path_fields: dict[str, str] = {}
     id_mapping: dict[str, object] = {}
+    id_mapping_with_records: dict[str, object] = {}
 
     query_upload = await _normalize_gene_set_upload(
         gmt_file=query_gene_set_file,
@@ -979,12 +1330,26 @@ async def _prepare_set_similarity(
         query_gene_set_text, query_mapping = query_upload
         files["uploads/query_gene_sets.gmt"] = query_gene_set_text
         path_fields["query_gene_set_path"] = "uploads/query_gene_sets.gmt"
-        id_mapping["query_collection"] = _mapping_payload(query_mapping)
+        id_mapping["query_collection"] = _mapping_payload(
+            query_mapping,
+            include_records=False,
+        )
+        id_mapping_with_records["query_collection"] = _mapping_payload(
+            query_mapping,
+            record_limit=None,
+        )
     if target_upload is not None:
         target_gene_set_text, target_mapping = target_upload
         files["uploads/target_gene_sets.gmt"] = target_gene_set_text
         path_fields["gene_set_path"] = "uploads/target_gene_sets.gmt"
-        id_mapping["target_collection"] = _mapping_payload(target_mapping)
+        id_mapping["target_collection"] = _mapping_payload(
+            target_mapping,
+            include_records=False,
+        )
+        id_mapping_with_records["target_collection"] = _mapping_payload(
+            target_mapping,
+            record_limit=None,
+        )
 
     genes: list[str] | None = None
     if query_upload is None:
@@ -997,14 +1362,15 @@ async def _prepare_set_similarity(
             submitted_genes = parse_gene_lines(text)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        mapping = mapper.map_many(submitted_genes)
+        mapping = await run_in_threadpool(mapper.map_many, submitted_genes)
         if not mapping.mapped:
             raise HTTPException(
                 status_code=400,
                 detail="none of the input genes are present in the embedding gene list",
             )
         genes = mapping.mapped
-        id_mapping["genes"] = _mapping_payload(mapping, record_limit=None)
+        id_mapping["genes"] = _mapping_payload(mapping, include_records=False)
+        id_mapping_with_records["genes"] = _mapping_payload(mapping, record_limit=None)
 
     request = SetSimilarityRequest(
         genes=genes,
@@ -1020,12 +1386,18 @@ async def _prepare_set_similarity(
         max_gene_set_size=max_gene_set_size,
         id_mapping=id_mapping,
     )
-    return request, files, path_fields
+    artifact_files = (
+        _mapping_report_artifact_files(id_mapping_with_records)
+        if include_mapping_artifact
+        else {}
+    )
+    return request, files, path_fields, artifact_files
 
 
 async def _prepare_gsea(
     *,
     settings: AndesSettings,
+    gene_mapping_service: GeneMappingService,
     ranked_file: UploadFile | None,
     gene_set_file: UploadFile | None,
     gene_set_obo_file: UploadFile | None,
@@ -1034,8 +1406,9 @@ async def _prepare_gsea(
     min_gene_set_size: int,
     max_gene_set_size: int,
     go_namespace: str,
-) -> tuple[GseaRequest, dict[str, str], dict[str, str]]:
-    mapper = _make_mapper(settings)
+    include_mapping_artifact: bool = False,
+) -> tuple[GseaRequest, dict[str, str], dict[str, str], dict[str, str]]:
+    mapper = await run_in_threadpool(_make_mapper, gene_mapping_service)
     text = ranked_text or ""
     if ranked_file is not None:
         text = await _read_upload_text(
@@ -1045,22 +1418,19 @@ async def _prepare_gsea(
         ranked_rows = parse_ranked_text(text)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    mapping = mapper.map_many([gene for gene, _score in ranked_rows])
-    if not mapping.mapped:
+    ranked_genes, mapping = await run_in_threadpool(_map_ranked_rows_or_raise, mapper, ranked_rows)
+    if not ranked_genes:
         raise HTTPException(
             status_code=400,
             detail="none of the ranked genes are present in the embedding gene list",
         )
-    score_by_submitted = {gene: score for gene, score in ranked_rows}
-    ranked_genes = [
-        (record.mapped, score_by_submitted[record.submitted])
-        for record in mapping.records
-        if record.mapped is not None
-    ]
 
     files: dict[str, str] = {}
     path_fields: dict[str, str] = {}
-    id_mapping: dict[str, object] = {"genes": _mapping_payload(mapping, record_limit=None)}
+    id_mapping: dict[str, object] = {"genes": _mapping_payload(mapping, include_records=False)}
+    id_mapping_with_records: dict[str, object] = {
+        "genes": _mapping_payload(mapping, record_limit=None)
+    }
     gene_set_upload = await _normalize_gene_set_upload(
         gmt_file=gene_set_file,
         obo_file=gene_set_obo_file,
@@ -1077,7 +1447,14 @@ async def _prepare_gsea(
         gene_set_text, gene_set_mapping = gene_set_upload
         files["uploads/gene_sets.gmt"] = gene_set_text
         path_fields["gene_set_path"] = "uploads/gene_sets.gmt"
-        id_mapping["target_collection"] = _mapping_payload(gene_set_mapping)
+        id_mapping["target_collection"] = _mapping_payload(
+            gene_set_mapping,
+            include_records=False,
+        )
+        id_mapping_with_records["target_collection"] = _mapping_payload(
+            gene_set_mapping,
+            record_limit=None,
+        )
 
     request = GseaRequest(
         ranked_genes=ranked_genes,
@@ -1088,7 +1465,12 @@ async def _prepare_gsea(
         max_gene_set_size=max_gene_set_size,
         id_mapping=id_mapping,
     )
-    return request, files, path_fields
+    artifact_files = (
+        _mapping_report_artifact_files(id_mapping_with_records)
+        if include_mapping_artifact
+        else {}
+    )
+    return request, files, path_fields, artifact_files
 
 
 def _request_with_temp_paths(
@@ -1259,7 +1641,14 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         token_hash_secret=settings.token_hash_secret,
     )
     engine: AndesEngine | None = None
-    app = FastAPI(title="ANDES App v2 API", version="0.1.0")
+    gene_mapping_service = GeneMappingService(settings)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        await run_in_threadpool(gene_mapping_service.initialize)
+        yield
+
+    app = FastAPI(title="ANDES App v2 API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -1271,6 +1660,7 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
     )
     app.state.store = store
     app.state.engine = None
+    app.state.gene_mapping_service = gene_mapping_service
 
     def get_engine() -> AndesEngine:
         nonlocal engine
@@ -1286,18 +1676,27 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
     @app.get("/data/status")
     def data_status(http_request: Request):
         _require_admin(http_request, settings)
+        gene_mapping_service.initialize()
+        gene_mapping_path = settings.resolved_gene_mapping_path()
         checks = {
             "original_src": settings.original_src.exists(),
             "embedding_path": settings.embedding_path.exists(),
             "gene_list_path": settings.gene_list_path.exists(),
             "default_gene_set_path": settings.default_gene_set_path.exists(),
         }
+        if gene_mapping_path is not None:
+            checks["gene_mapping_path"] = gene_mapping_path.exists()
+            mapping_status = gene_mapping_service.status()
+            checks["gene_mapping_index"] = gene_mapping_path.exists() and mapping_status.ready
+        else:
+            mapping_status = gene_mapping_service.status()
         return {
             "ready": all(checks.values()),
             "checks": checks,
             "cache": _cache_status(settings.cache_dir),
             "jobs": store.storage_status(),
             "config": _config_status(settings),
+            "gene_mapping": mapping_status.as_dict(),
         }
 
     @app.get("/admin/queue")
@@ -1336,8 +1735,9 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         go_namespace: str = Form(default="biological_process"),
     ):
         _validate_size_range(min_gene_set_size, max_gene_set_size)
-        request, files, path_fields = await _prepare_set_similarity(
+        request, files, path_fields, _artifact_files = await _prepare_set_similarity(
             settings=settings,
+            gene_mapping_service=gene_mapping_service,
             genes_file=genes_file,
             query_gene_set_file=query_gene_set_file,
             query_obo_file=query_obo_file,
@@ -1358,9 +1758,13 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
             settings=settings,
         )
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
-                preview = get_engine().preview_set_similarity(preview_request)
+            preview = await run_in_threadpool(
+                _preview_set_similarity_with_temp_paths,
+                get_engine(),
+                request,
+                files,
+                path_fields,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _public_preview_with_digest(preview, digest_payload, settings)
@@ -1382,8 +1786,9 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         preview_digest: str | None = Form(default=None),
     ):
         _validate_size_range(min_gene_set_size, max_gene_set_size)
-        request, files, path_fields = await _prepare_set_similarity(
+        request, files, path_fields, artifact_files = await _prepare_set_similarity(
             settings=settings,
+            gene_mapping_service=gene_mapping_service,
             genes_file=genes_file,
             query_gene_set_file=query_gene_set_file,
             query_obo_file=query_obo_file,
@@ -1395,6 +1800,7 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
             min_gene_set_size=min_gene_set_size,
             max_gene_set_size=max_gene_set_size,
             go_namespace=go_namespace,
+            include_mapping_artifact=True,
         )
         digest_payload = _preview_digest_payload(
             kind=AnalysisKind.SET_SIMILARITY,
@@ -1405,10 +1811,14 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         )
         if not _preview_digest_matches(preview_digest, digest_payload, settings):
             try:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
-                    preview = get_engine().preview_set_similarity(preview_request)
-                    _raise_if_preview_blocked(preview)
+                preview = await run_in_threadpool(
+                    _preview_set_similarity_with_temp_paths,
+                    get_engine(),
+                    request,
+                    files,
+                    path_fields,
+                )
+                _raise_if_preview_blocked(preview)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         owner_key = _owner_key(http_request, settings)
@@ -1417,7 +1827,7 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         job = store.create_job(
             AnalysisKind.SET_SIMILARITY,
             request.model_dump(mode="json"),
-            files=files,
+            files={**files, **artifact_files},
             path_fields=path_fields,
             owner_key=owner_key,
             access_token=access_token,
@@ -1436,8 +1846,9 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         go_namespace: str = Form(default="biological_process"),
     ):
         _validate_size_range(min_gene_set_size, max_gene_set_size)
-        request, files, path_fields = await _prepare_gsea(
+        request, files, path_fields, _artifact_files = await _prepare_gsea(
             settings=settings,
+            gene_mapping_service=gene_mapping_service,
             ranked_file=ranked_file,
             gene_set_file=gene_set_file,
             gene_set_obo_file=gene_set_obo_file,
@@ -1455,9 +1866,13 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
             settings=settings,
         )
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
-                preview = get_engine().preview_gsea(preview_request)
+            preview = await run_in_threadpool(
+                _preview_gsea_with_temp_paths,
+                get_engine(),
+                request,
+                files,
+                path_fields,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _public_preview_with_digest(preview, digest_payload, settings)
@@ -1476,8 +1891,9 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         preview_digest: str | None = Form(default=None),
     ):
         _validate_size_range(min_gene_set_size, max_gene_set_size)
-        request, files, path_fields = await _prepare_gsea(
+        request, files, path_fields, artifact_files = await _prepare_gsea(
             settings=settings,
+            gene_mapping_service=gene_mapping_service,
             ranked_file=ranked_file,
             gene_set_file=gene_set_file,
             gene_set_obo_file=gene_set_obo_file,
@@ -1486,6 +1902,7 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
             min_gene_set_size=min_gene_set_size,
             max_gene_set_size=max_gene_set_size,
             go_namespace=go_namespace,
+            include_mapping_artifact=True,
         )
         digest_payload = _preview_digest_payload(
             kind=AnalysisKind.GSEA,
@@ -1496,10 +1913,14 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         )
         if not _preview_digest_matches(preview_digest, digest_payload, settings):
             try:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    preview_request = _request_with_temp_paths(request, files, path_fields, tmpdir)
-                    preview = get_engine().preview_gsea(preview_request)
-                    _raise_if_preview_blocked(preview)
+                preview = await run_in_threadpool(
+                    _preview_gsea_with_temp_paths,
+                    get_engine(),
+                    request,
+                    files,
+                    path_fields,
+                )
+                _raise_if_preview_blocked(preview)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         owner_key = _owner_key(http_request, settings)
@@ -1508,7 +1929,7 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
         job = store.create_job(
             AnalysisKind.GSEA,
             request.model_dump(mode="json"),
-            files=files,
+            files={**files, **artifact_files},
             path_fields=path_fields,
             owner_key=owner_key,
             access_token=access_token,
@@ -1604,6 +2025,7 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
             "pair-table.csv",
             "matrix.csv",
             "mapping-report.csv",
+            "mapping-provenance.json",
             "report.zip",
         }
         if filename not in allowed:
@@ -1617,6 +2039,20 @@ def create_app(settings: AndesSettings | None = None) -> FastAPI:
                 headers={
                     **_NO_STORE_HEADERS,
                     "Content-Disposition": 'attachment; filename="results.json"',
+                },
+            )
+        if filename == "mapping-provenance.json":
+            result = store.read_result(job_id)
+            if result is None:
+                raise HTTPException(status_code=404, detail="download not available")
+            provenance = _mapping_provenance_payload(_public_result_payload(result, settings))
+            if provenance is None:
+                raise HTTPException(status_code=404, detail="download not available")
+            return JSONResponse(
+                content=provenance,
+                headers={
+                    **_NO_STORE_HEADERS,
+                    "Content-Disposition": 'attachment; filename="mapping-provenance.json"',
                 },
             )
         if filename == "report.zip":

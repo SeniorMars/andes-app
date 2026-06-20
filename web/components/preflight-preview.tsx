@@ -34,6 +34,7 @@ function Metric({
 
 function GeneSummary({ genes }: { genes: GenePreview }) {
   const idTypes = Object.entries(genes.id_type_counts);
+  const sourceCounts = Object.entries(genes.source_counts ?? {});
   return (
     <div className="preview-block">
       <h4>Gene IDs</h4>
@@ -46,6 +47,15 @@ function GeneSummary({ genes }: { genes: GenePreview }) {
           {idTypes.map(([idType, count]) => (
             <span key={idType}>
               {idType}: {formatInteger(count)}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {sourceCounts.length ? (
+        <div className="chip-list compact">
+          {sourceCounts.map(([source, count]) => (
+            <span key={source}>
+              {source}: {formatInteger(count)}
             </span>
           ))}
         </div>

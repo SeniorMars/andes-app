@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 from enum import StrEnum
 from pathlib import Path
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class AnalysisKind(StrEnum):
@@ -64,7 +66,18 @@ class GseaRequest(BaseAnalysisRequest):
     def require_ranked_genes(cls, value: list[tuple[str, float]]) -> list[tuple[str, float]]:
         if not value:
             raise ValueError("at least one ranked gene is required")
-        return [(gene.strip(), float(score)) for gene, score in value if gene.strip()]
+        rows: list[tuple[str, float]] = []
+        for gene, score in value:
+            cleaned_gene = gene.strip()
+            if not cleaned_gene:
+                continue
+            parsed_score = float(score)
+            if not math.isfinite(parsed_score):
+                raise ValueError("ranked gene scores must be finite")
+            rows.append((cleaned_gene, parsed_score))
+        if not rows:
+            raise ValueError("at least one ranked gene is required")
+        return rows
 
 
 class ResultTerm(BaseModel):
@@ -85,6 +98,57 @@ class ResultTerm(BaseModel):
     significant: bool
 
 
+class ResultParametersBase(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mode: str
+    min_gene_set_size: int
+    max_gene_set_size: int
+    null_iterations: int
+    workers: int
+    seed: int | None = None
+    seed_strategy: str | None = None
+    total_pairs: int
+    id_mapping: dict[str, object] = Field(default_factory=dict)
+    analysis_provenance: dict[str, object] = Field(default_factory=dict)
+    cache: dict[str, object] = Field(default_factory=dict)
+    timing_seconds: dict[str, float] = Field(default_factory=dict)
+
+    def __getitem__(self, key: str) -> Any:
+        return self.model_dump()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.model_dump().get(key, default)
+
+
+class GeneListResultParameters(ResultParametersBase):
+    mode: Literal["gene_list"]
+    gene_set_path: str
+    target_term_count: int
+
+
+class GeneSetCollectionResultParameters(ResultParametersBase):
+    mode: Literal["gene_set_collection"]
+    query_gene_set_path: str
+    gene_set_path: str
+    query_term_count: int
+    target_term_count: int
+    returned_rows: int
+
+
+class GseaResultParameters(ResultParametersBase):
+    mode: Literal["ranked_enrichment"]
+    gene_set_path: str
+    target_term_count: int
+    gsea_trace: dict[str, object] | None = None
+
+
+ResultParameters = Annotated[
+    GeneListResultParameters | GeneSetCollectionResultParameters | GseaResultParameters,
+    Field(discriminator="mode"),
+]
+
+
 class AnalysisResult(BaseModel):
     kind: AnalysisKind
     results: list[ResultTerm]
@@ -92,7 +156,7 @@ class AnalysisResult(BaseModel):
     valid_gene_count: int
     invalid_genes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
-    parameters: dict[str, object] = Field(default_factory=dict)
+    parameters: ResultParameters
 
 
 class JobRecord(BaseModel):

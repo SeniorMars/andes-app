@@ -10,7 +10,8 @@ from andes_api.storage import JobStore
 from .cache import prune_cache
 from .config import AndesSettings
 from .engine import AndesEngine
-from .io import parse_gene_lines, parse_ranked_text
+from .gene_mapping import GeneMappingService
+from .io import parse_gene_lines, parse_ranked_text, validate_gene_mapping_file
 from .schemas import GseaRequest, SetSimilarityRequest
 
 app = typer.Typer(help="ANDES v2 core CLI")
@@ -23,18 +24,54 @@ def _engine() -> AndesEngine:
 @app.command("validate-data")
 def validate_data() -> None:
     settings = AndesSettings()
+    gene_mapping_path = settings.resolved_gene_mapping_path()
     required = {
         "original_src": settings.original_src,
         "embedding_path": settings.embedding_path,
         "gene_list_path": settings.gene_list_path,
         "default_gene_set_path": settings.default_gene_set_path,
     }
+    if gene_mapping_path is not None:
+        required["gene_mapping_path"] = gene_mapping_path
     missing = [f"{name}: {path}" for name, path in required.items() if not Path(path).exists()]
     if missing:
         for item in missing:
             typer.echo(f"missing {item}", err=True)
         raise typer.Exit(1)
+    gene_mapping_service = GeneMappingService(settings)
+    gene_mapping_service.initialize(force=True)
+    mapping_status = gene_mapping_service.status()
+    if not mapping_status.ready:
+        typer.echo(f"gene mapping index unavailable: {mapping_status.error}", err=True)
+        raise typer.Exit(1)
     typer.echo("ANDES data paths are present.")
+    if settings.resolved_gene_mapping_path() is not None:
+        typer.echo("Gene mapping index is ready.")
+
+
+@app.command("validate-gene-mapping")
+def validate_gene_mapping() -> None:
+    settings = AndesSettings()
+    mapping_path = settings.resolved_gene_mapping_path()
+    sqlite_path = settings.resolved_gene_mapping_sqlite_path()
+    if mapping_path is None or sqlite_path is None:
+        typer.echo(
+            "gene mapping is not configured; set ANDES_GENE_MAPPING_DIR or "
+            "ANDES_GENE_MAPPING_PATH",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if not mapping_path.exists():
+        typer.echo(f"missing gene_mapping_path: {mapping_path}", err=True)
+        raise typer.Exit(1)
+    result = validate_gene_mapping_file(
+        mapping_path=mapping_path,
+        sqlite_path=sqlite_path,
+        gene_list_path=settings.gene_list_path,
+        species=settings.normalized_species(),
+        canonical_id_namespace=settings.normalized_canonical_id_namespace(),
+    )
+    typer.echo(json.dumps(result, indent=2))
 
 
 @app.command("run-set")

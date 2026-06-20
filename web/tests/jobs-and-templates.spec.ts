@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 
 const JOB_TOKENS_STORAGE_KEY = "andes.jobTokens.v1";
 const RUN_TEMPLATES_STORAGE_KEY = "andes.runTemplates.v1";
@@ -92,6 +93,107 @@ function jobResponse(jobId: string, token = "job-secret") {
   };
 }
 
+function gseaJobResponse(jobId: string, token = "job-secret") {
+  return {
+    job: {
+      id: jobId,
+      kind: "gsea",
+      state: "succeeded",
+      created_at: "2026-06-15T12:00:00+00:00",
+      started_at: "2026-06-15T12:01:00+00:00",
+      finished_at: "2026-06-15T12:02:00+00:00",
+      cancelled_at: null,
+      error: null,
+      access_token: token
+    },
+    queue: {
+      position: null,
+      queued_ahead: 0
+    },
+    result: {
+      kind: "gsea",
+      results: [
+        {
+          term: "TERM_A",
+          description: "alpha pathway",
+          size: 3,
+          true_score: 0.5,
+          z_score: 2.4,
+          p_value: 0.01,
+          p_value_corrected: 0.02,
+          log10_p_value_corrected: 1.7,
+          significant: true
+        }
+      ],
+      input_gene_count: 4,
+      valid_gene_count: 4,
+      invalid_genes: [],
+      warnings: [],
+      parameters: {
+        mode: "ranked_enrichment",
+        total_pairs: 1,
+        gsea_trace: {
+          algorithm: "andes_best_match_trace_v1",
+          exact: true,
+          ranked_gene_count: 4,
+          max_points_per_term: 600,
+          terms: [
+            {
+              term: "TERM_A",
+              description: "alpha pathway",
+              size: 3,
+              true_score: 0.5,
+              z_score: 2.4,
+              p_value_corrected: 0.02,
+              es: 0.5,
+              es_rank: 3,
+              sampled: false,
+              points: [
+                {
+                  rank: 1,
+                  gene: "GENE1",
+                  rank_score: 3,
+                  best_match_gene: "GENE_A",
+                  match_score: 0.4,
+                  centered_score: -0.1,
+                  running_es: -0.1
+                },
+                {
+                  rank: 2,
+                  gene: "GENE2",
+                  rank_score: 2,
+                  best_match_gene: "GENE_B",
+                  match_score: 0.7,
+                  centered_score: 0.2,
+                  running_es: 0.1
+                },
+                {
+                  rank: 3,
+                  gene: "GENE3",
+                  rank_score: 1,
+                  best_match_gene: "GENE_C",
+                  match_score: 0.8,
+                  centered_score: 0.3,
+                  running_es: 0.4
+                },
+                {
+                  rank: 4,
+                  gene: "GENE4",
+                  rank_score: 0,
+                  best_match_gene: "GENE_D",
+                  match_score: 0.5,
+                  centered_score: -0.4,
+                  running_es: 0
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  };
+}
+
 test("job result URL token is stored and stripped from the address bar", async ({ page }) => {
   const seenTokens: string[] = [];
 
@@ -146,6 +248,115 @@ test("download requests use the stored job token header without query tokens", a
 
   await expect.poll(() => downloadHeader).toBe("download-secret");
   expect(downloadUrl).not.toContain("token=");
+});
+
+test("mapping summary shows all collections and full excluded count", async ({ page }) => {
+  const response = jobResponse("mapping-summary-job", "mapping-secret") as unknown as {
+    result: {
+      invalid_genes: string[];
+      parameters: Record<string, unknown>;
+    };
+  };
+  response.result.invalid_genes = ["EXAMPLE_ONLY"];
+  response.result.parameters.id_mapping = {
+    genes: {
+      mapped_count: 2,
+      submitted_record_count: 15,
+      unresolved_count: 13,
+      unmapped_count: 10,
+      ambiguous_count: 3,
+      source_counts: {
+        direct_entrez: 1,
+        gene_mapping: 1,
+        alias_file: 0,
+        unmapped: 10,
+        ambiguous: 3
+      },
+      mapping_report: "mapping-report.csv"
+    },
+    target_collection: {
+      mapped_count: 4,
+      submitted_record_count: 5,
+      unresolved_count: 1,
+      unmapped_count: 1,
+      ambiguous_count: 0,
+      source_counts: {
+        direct_entrez: 0,
+        gene_mapping: 4,
+        alias_file: 0,
+        unmapped: 1,
+        ambiguous: 0
+      },
+      mapping_report: "mapping-report.csv"
+    }
+  };
+
+  await page.route(`${API_BASE}/jobs/mapping-summary-job`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify(response),
+      contentType: "application/json",
+      status: 200
+    });
+  });
+
+  await page.goto("/jobs/mapping-summary-job?token=mapping-secret");
+
+  await expect(page.locator(".summary-card", { hasText: "excluded genes" })).toContainText("13");
+  await expect(page.getByRole("heading", { name: "Target collection" })).toBeVisible();
+  await expect(page.getByText("ambiguous: 3")).toBeVisible();
+  await expect(page.getByText("gene_mapping: 4")).toBeVisible();
+});
+
+test("downloaded chart SVG is standalone and renders without app CSS", async ({ page }) => {
+  await page.route(`${API_BASE}/jobs/svg-job`, async (route) => {
+    await route.fulfill({
+      body: JSON.stringify(gseaJobResponse("svg-job", "svg-secret")),
+      contentType: "application/json",
+      status: 200
+    });
+  });
+
+  await page.goto("/jobs/svg-job?token=svg-secret");
+  await expect(page.getByRole("heading", { name: "Running score" })).toBeVisible();
+
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export SVG" }).first().click();
+  const download = await downloadPromise;
+  const path = await download.path();
+  expect(path).toBeTruthy();
+  const svg = await readFile(path as string, "utf8");
+
+  expect(svg).toContain('xmlns="http://www.w3.org/2000/svg"');
+  expect(svg).not.toContain("var(");
+  expect(svg).toContain("stroke=");
+  expect(svg).toContain("fill=");
+
+  const rendered = await page.evaluate(async (svgText) => {
+    const encoded = btoa(unescape(encodeURIComponent(svgText)));
+    const image = new Image();
+    image.src = `data:image/svg+xml;base64,${encoded}`;
+    await image.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth || 820;
+    canvas.height = image.naturalHeight || 390;
+    const context = canvas.getContext("2d");
+    if (!context) return { painted: 0, width: 0, height: 0 };
+    context.drawImage(image, 0, 0);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let painted = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      const alpha = pixels[index + 3];
+      const red = pixels[index];
+      const green = pixels[index + 1];
+      const blue = pixels[index + 2];
+      if (alpha > 0 && (red < 245 || green < 245 || blue < 245)) painted += 1;
+    }
+    return { painted, width: canvas.width, height: canvas.height };
+  }, svg);
+
+  expect(rendered.width).toBeGreaterThan(0);
+  expect(rendered.height).toBeGreaterThan(0);
+  expect(rendered.painted).toBeGreaterThan(100);
 });
 
 test("template with missing uploaded files blocks preview until explicitly cleared", async ({

@@ -13,12 +13,21 @@ from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
 
 from .config import AndesSettings, get_settings
+from .gsea_trace import (
+    compute_gsea_es_trace,
+    gsea_trace_payload,
+    sample_trace_indices,
+)
 from .io import clean_gene_list, load_embedding
 from .legacy import load_legacy_modules
+from .provenance import analysis_provenance
 from .schemas import (
     AnalysisKind,
     AnalysisResult,
+    GeneListResultParameters,
+    GeneSetCollectionResultParameters,
     GseaRequest,
+    GseaResultParameters,
     ResultTerm,
     SetSimilarityRequest,
 )
@@ -34,7 +43,9 @@ class GeneCounts(NamedTuple):
     input_count: int
     matched_count: int
     unmapped: list[str]
+    unmapped_count: int
     id_type_counts: dict[str, int]
+    source_counts: dict[str, int]
 
 
 class CacheBuild(NamedTuple):
@@ -45,6 +56,23 @@ class CacheBuild(NamedTuple):
 class SeedResolution(NamedTuple):
     seed: int
     strategy: str
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) else None
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _sample_trace_indices(
+    length: int,
+    max_points: int,
+    *,
+    required_index: int,
+) -> list[int]:
+    return sample_trace_indices(length, max_points, required_index=required_index)
 
 
 @contextlib.contextmanager
@@ -64,7 +92,11 @@ def cache_file_lock(cache_path: Path):
 class AndesEngine:
     def __init__(self, settings: AndesSettings | None = None):
         self.settings = settings or get_settings()
-        self.legacy = load_legacy_modules(self.settings.original_src)
+        self.legacy = load_legacy_modules(
+            self.settings.original_src,
+            adapter_module=self.settings.normalized_original_adapter_module(),
+            expected_revision=self.settings.normalized_original_revision(),
+        )
 
     def run_set_similarity(
         self, request: SetSimilarityRequest, artifact_dir: Path | None = None
@@ -186,24 +218,25 @@ class AndesEngine:
             input_gene_count=gene_counts.input_count,
             valid_gene_count=gene_counts.matched_count,
             invalid_genes=gene_counts.unmapped,
-            warnings=self._warnings(gene_counts.unmapped),
-            parameters={
-                "min_gene_set_size": request.min_gene_set_size,
-                "max_gene_set_size": request.max_gene_set_size,
-                "null_iterations": ite,
-                "workers": workers,
-                "seed": cache_build.profile.get("seed"),
-                "seed_strategy": cache_build.profile.get("seed_strategy"),
-                "mode": "gene_list",
-                "gene_set_path": str(paths["gene_set"]),
-                "target_term_count": len(target_terms),
-                "total_pairs": len(target_terms),
-                "id_mapping": request.id_mapping,
-                "cache": cache_build.profile,
-                "timing_seconds": self._timing_profile(
+            warnings=self._warnings(gene_counts.unmapped, gene_counts.unmapped_count),
+            parameters=GeneListResultParameters(
+                min_gene_set_size=request.min_gene_set_size,
+                max_gene_set_size=request.max_gene_set_size,
+                null_iterations=ite,
+                workers=workers,
+                seed=_optional_int(cache_build.profile.get("seed")),
+                seed_strategy=_optional_str(cache_build.profile.get("seed_strategy")),
+                mode="gene_list",
+                gene_set_path=str(paths["gene_set"]),
+                target_term_count=len(target_terms),
+                total_pairs=len(target_terms),
+                id_mapping=request.id_mapping,
+                analysis_provenance=self._analysis_provenance(paths),
+                cache=cache_build.profile,
+                timing_seconds=self._timing_profile(
                     cache_build.profile, scoring_seconds, total_seconds
                 ),
-            },
+            ),
         )
         self._write_result_downloads(artifact_dir, result)
         return result
@@ -333,26 +366,27 @@ class AndesEngine:
             valid_gene_count=len(query_terms),
             invalid_genes=[],
             warnings=[],
-            parameters={
-                "min_gene_set_size": request.min_gene_set_size,
-                "max_gene_set_size": request.max_gene_set_size,
-                "null_iterations": ite,
-                "workers": workers,
-                "seed": cache_build.profile.get("seed"),
-                "seed_strategy": cache_build.profile.get("seed_strategy"),
-                "mode": "gene_set_collection",
-                "query_gene_set_path": str(paths["query_gene_set"]),
-                "gene_set_path": str(paths["gene_set"]),
-                "query_term_count": len(query_terms),
-                "target_term_count": len(target_terms),
-                "total_pairs": pair_count,
-                "returned_rows": len(rows),
-                "id_mapping": request.id_mapping,
-                "cache": cache_build.profile,
-                "timing_seconds": self._timing_profile(
+            parameters=GeneSetCollectionResultParameters(
+                min_gene_set_size=request.min_gene_set_size,
+                max_gene_set_size=request.max_gene_set_size,
+                null_iterations=ite,
+                workers=workers,
+                seed=_optional_int(cache_build.profile.get("seed")),
+                seed_strategy=_optional_str(cache_build.profile.get("seed_strategy")),
+                mode="gene_set_collection",
+                query_gene_set_path=str(paths["query_gene_set"]),
+                gene_set_path=str(paths["gene_set"]),
+                query_term_count=len(query_terms),
+                target_term_count=len(target_terms),
+                total_pairs=pair_count,
+                returned_rows=len(rows),
+                id_mapping=request.id_mapping,
+                analysis_provenance=self._analysis_provenance(paths),
+                cache=cache_build.profile,
+                timing_seconds=self._timing_profile(
                     cache_build.profile, scoring_seconds, total_seconds
                 ),
-            },
+            ),
         )
         self._write_collection_downloads(
             artifact_dir=artifact_dir,
@@ -385,7 +419,8 @@ class AndesEngine:
 
         ranked = sorted(request.ranked_genes, key=lambda row: row[1], reverse=True)
         ranked_genes = [gene for gene, _score in ranked]
-        valid_ranked = [gene for gene in ranked_genes if gene in node2index]
+        valid_ranked_pairs = [(gene, score) for gene, score in ranked if gene in node2index]
+        valid_ranked = [gene for gene, _score in valid_ranked_pairs]
         invalid_genes = [gene for gene in ranked_genes if gene not in node2index]
         gene_counts = self._gene_counts_from_mapping(
             request.id_mapping.get("genes"),
@@ -431,7 +466,6 @@ class AndesEngine:
             cache,
         )
         scoring_seconds = time.perf_counter() - scoring_start
-        total_seconds = time.perf_counter() - total_start
         z = np.asarray([z_scores[term] for term in geneset_terms], dtype=np.float64)
         p_values = 2 * (1 - norm.cdf(np.abs(z)))
         p_corrected = multipletests(p_values, method="fdr_bh")[1]
@@ -444,6 +478,18 @@ class AndesEngine:
             p_corrected=p_corrected,
             true_scores=[float(true_scores[term]) for term in geneset_terms],
         )
+        trace_start = time.perf_counter()
+        gsea_trace = self._gsea_trace_payload(
+            e_unit=e_unit,
+            geneset_indices=geneset_indices_np,
+            node_list=node_list,
+            ranked_emb=ranked_emb,
+            ranked_genes=valid_ranked_pairs,
+            rows=rows,
+            term_names=term_names,
+        )
+        trace_seconds = time.perf_counter() - trace_start
+        total_seconds = time.perf_counter() - total_start
 
         result = AnalysisResult(
             kind=AnalysisKind.GSEA,
@@ -451,23 +497,29 @@ class AndesEngine:
             input_gene_count=gene_counts.input_count,
             valid_gene_count=gene_counts.matched_count,
             invalid_genes=gene_counts.unmapped,
-            warnings=self._warnings(gene_counts.unmapped),
-            parameters={
-                "min_gene_set_size": request.min_gene_set_size,
-                "max_gene_set_size": request.max_gene_set_size,
-                "null_iterations": ite,
-                "workers": workers,
-                "seed": cache_build.profile.get("seed"),
-                "seed_strategy": cache_build.profile.get("seed_strategy"),
-                "gene_set_path": str(paths["gene_set"]),
-                "target_term_count": len(geneset_terms),
-                "total_pairs": len(geneset_terms),
-                "id_mapping": request.id_mapping,
-                "cache": cache_build.profile,
-                "timing_seconds": self._timing_profile(
-                    cache_build.profile, scoring_seconds, total_seconds
+            warnings=self._warnings(gene_counts.unmapped, gene_counts.unmapped_count),
+            parameters=GseaResultParameters(
+                min_gene_set_size=request.min_gene_set_size,
+                max_gene_set_size=request.max_gene_set_size,
+                null_iterations=ite,
+                workers=workers,
+                seed=_optional_int(cache_build.profile.get("seed")),
+                seed_strategy=_optional_str(cache_build.profile.get("seed_strategy")),
+                mode="ranked_enrichment",
+                gene_set_path=str(paths["gene_set"]),
+                target_term_count=len(geneset_terms),
+                total_pairs=len(geneset_terms),
+                id_mapping=request.id_mapping,
+                gsea_trace=gsea_trace,
+                analysis_provenance=self._analysis_provenance(paths),
+                cache=cache_build.profile,
+                timing_seconds=self._timing_profile(
+                    cache_build.profile,
+                    scoring_seconds,
+                    total_seconds,
+                    trace_seconds=trace_seconds,
                 ),
-            },
+            ),
         )
         self._write_result_downloads(artifact_dir, result)
         return result
@@ -524,9 +576,10 @@ class AndesEngine:
                 "genes": {
                     "input_count": gene_counts.input_count,
                     "matched_count": gene_counts.matched_count,
-                    "unmatched_count": len(gene_counts.unmapped),
+                    "unmatched_count": gene_counts.unmapped_count,
                     "unmatched_examples": gene_counts.unmapped[:10],
                     "id_type_counts": gene_counts.id_type_counts,
+                    "source_counts": gene_counts.source_counts,
                 },
                 "target_collection": self._collection_summary(target_sets, target_indices_np),
                 "cache": cache,
@@ -622,9 +675,10 @@ class AndesEngine:
             "genes": {
                 "input_count": gene_counts.input_count,
                 "matched_count": gene_counts.matched_count,
-                "unmatched_count": len(gene_counts.unmapped),
+                "unmatched_count": gene_counts.unmapped_count,
                 "unmatched_examples": gene_counts.unmapped[:10],
                 "id_type_counts": gene_counts.id_type_counts,
+                "source_counts": gene_counts.source_counts,
             },
             "target_collection": self._collection_summary(gene_sets, geneset_indices_np),
             "cache": cache,
@@ -992,13 +1046,19 @@ class AndesEngine:
         cache_profile: dict[str, object],
         scoring_seconds: float,
         total_seconds: float,
+        *,
+        trace_seconds: float = 0.0,
     ) -> dict[str, float]:
         cache_seconds = cache_profile.get("cache_seconds", 0.0)
         return {
             "cache": float(cache_seconds) if isinstance(cache_seconds, (int, float)) else 0.0,
             "scoring": scoring_seconds,
+            "trace": trace_seconds,
             "total": total_seconds,
         }
+
+    def _analysis_provenance(self, paths: dict[str, Path]) -> dict[str, object]:
+        return analysis_provenance(paths=paths, settings=self.settings, legacy=self.legacy)
 
     def _collection_summary(self, raw_sets: dict, filtered_indices: dict) -> dict[str, object]:
         genes = set().union(*raw_sets.values()) if raw_sets else set()
@@ -1016,6 +1076,45 @@ class AndesEngine:
             "max_usable_size": max(size_values) if size_values else None,
         }
 
+    def _gsea_trace_payload(
+        self,
+        *,
+        e_unit: np.ndarray,
+        geneset_indices: dict[str, np.ndarray],
+        node_list: list[str],
+        ranked_emb: np.ndarray,
+        ranked_genes: list[tuple[str, float]],
+        rows: list[ResultTerm],
+        term_names: dict[str, str],
+        max_terms: int = 5,
+        max_points: int = 600,
+    ) -> dict[str, object] | None:
+        return gsea_trace_payload(
+            e_unit=e_unit,
+            geneset_indices=geneset_indices,
+            node_list=node_list,
+            ranked_emb=ranked_emb,
+            ranked_genes=ranked_genes,
+            rows=rows,
+            term_names=term_names,
+            query_memory_mb=self.settings.query_memory_mb,
+            max_terms=max_terms,
+            max_points=max_points,
+        )
+
+    def _compute_gsea_es_trace(
+        self,
+        e_unit: np.ndarray,
+        gene_set_idx: np.ndarray,
+        ranked_emb: np.ndarray,
+    ) -> dict[str, np.ndarray | int | float]:
+        return compute_gsea_es_trace(
+            e_unit=e_unit,
+            gene_set_idx=gene_set_idx,
+            ranked_emb=ranked_emb,
+            query_memory_mb=self.settings.query_memory_mb,
+        )
+
     def _gene_counts_from_mapping(
         self,
         mapping: object,
@@ -1027,21 +1126,45 @@ class AndesEngine:
         if isinstance(mapping, dict):
             records = mapping.get("records")
             mapped_count = mapping.get("mapped_count", matched_count)
+            submitted_record_count = mapping.get("submitted_record_count")
             unmapped_examples = mapping.get("unmapped_examples", unmapped)
+            ambiguous_examples = mapping.get("ambiguous_examples", [])
+            if isinstance(unmapped_examples, list):
+                unresolved_examples = list(unmapped_examples)
+                if isinstance(ambiguous_examples, list):
+                    unresolved_examples.extend(ambiguous_examples)
+            else:
+                unresolved_examples = unmapped
+            example_count = len(unmapped_examples) if isinstance(unmapped_examples, list) else 0
+            unresolved_count = mapping.get(
+                "unresolved_count",
+                mapping.get("unmapped_count", example_count),
+            )
             id_type_counts = mapping.get("id_type_counts", {})
+            source_counts = mapping.get("source_counts", {})
+            if isinstance(records, list):
+                resolved_input_count = len(records)
+            elif isinstance(submitted_record_count, (int, float)):
+                resolved_input_count = int(submitted_record_count)
+            else:
+                resolved_input_count = input_count
             return GeneCounts(
-                input_count=len(records) if isinstance(records, list) else input_count,
+                input_count=resolved_input_count,
                 matched_count=int(mapped_count),
-                unmapped=list(unmapped_examples)
-                if isinstance(unmapped_examples, list)
-                else unmapped,
+                unmapped=unresolved_examples,
+                unmapped_count=int(unresolved_count)
+                if isinstance(unresolved_count, (int, float))
+                else len(unmapped),
                 id_type_counts=id_type_counts if isinstance(id_type_counts, dict) else {},
+                source_counts=source_counts if isinstance(source_counts, dict) else {},
             )
         return GeneCounts(
             input_count=input_count,
             matched_count=matched_count,
             unmapped=unmapped,
+            unmapped_count=len(unmapped),
             id_type_counts={},
+            source_counts={},
         )
 
     def _enforce_pair_limit(self, pair_count: int) -> None:
@@ -1197,7 +1320,8 @@ class AndesEngine:
             )
         return sorted(rows, key=lambda row: row.z_score, reverse=True)
 
-    def _warnings(self, invalid_genes: list[str]) -> list[str]:
-        if not invalid_genes:
+    def _warnings(self, invalid_genes: list[str], invalid_count: int | None = None) -> list[str]:
+        count = len(invalid_genes) if invalid_count is None else invalid_count
+        if count <= 0:
             return []
-        return [f"{len(invalid_genes)} gene(s) were not found in the embedding and were excluded."]
+        return [f"{count} gene(s) were not found in the embedding and were excluded."]

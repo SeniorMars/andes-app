@@ -39,8 +39,11 @@ BENCHMARK_GSEA_EXAMPLE = [
 DATA_AVAILABLE = all(path.exists() for path in [EMBEDDING, GENE_LIST, GENE_SET, RANKED_LIST])
 
 
-def test_default_paths_are_repo_relative_mount_paths():
-    settings = AndesSettings()
+def test_default_paths_are_repo_relative_mount_paths(monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("ANDES_"):
+            monkeypatch.delenv(key, raising=False)
+    settings = AndesSettings(_env_file=None)
 
     assert settings.original_src == Path("../andes-original/src")
     assert settings.embedding_path == Path(
@@ -52,6 +55,9 @@ def test_default_paths_are_repo_relative_mount_paths():
     )
     assert settings.null_iterations == 1000
     assert settings.seed is None
+    assert settings.species == "hsa"
+    assert settings.canonical_id_namespace == "entrez"
+    assert settings.gene_mapping_min_overlap == 0.05
 
 
 @pytest.mark.skipif(not DATA_AVAILABLE, reason="original ANDES benchmark data not available")

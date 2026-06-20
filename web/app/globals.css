@@ -658,6 +658,17 @@ button:disabled {
   line-height: 1.45;
 }
 
+.mapping-summary + .mapping-summary {
+  border-top: 1px solid var(--line);
+  margin-top: 18px;
+  padding-top: 18px;
+}
+
+.mapping-summary h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+}
+
 .preview-block {
   display: grid;
   gap: 10px;
@@ -1140,10 +1151,18 @@ td.mono {
   stroke-width: 1;
 }
 
+.chart-axis.soft {
+  stroke: var(--line);
+}
+
 .chart-label {
   fill: var(--muted);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 11px;
+}
+
+.chart-label.align-end {
+  text-anchor: end;
 }
 
 .chart-title {
@@ -1160,6 +1179,53 @@ td.mono {
 .chart-point.significant {
   fill: var(--teal);
   opacity: 0.94;
+}
+
+.segmented-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.segment {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  padding: 7px 11px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.segment.active {
+  border-color: color-mix(in srgb, var(--teal) 64%, var(--line));
+  background: var(--note-bg);
+  color: var(--teal-dark);
+}
+
+.gsea-running-line {
+  fill: none;
+  stroke: var(--indigo);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.6;
+}
+
+.gsea-match-bar {
+  stroke: var(--teal);
+  stroke-linecap: round;
+  stroke-opacity: 0.42;
+  stroke-width: 1.4;
+}
+
+.gsea-peak-line {
+  stroke: var(--amber);
+  stroke-dasharray: 4 4;
+  stroke-opacity: 0.72;
+  stroke-width: 1.4;
 }
 
 .heat-cell {
